@@ -1,43 +1,50 @@
-// Cloudflare Worker - minimal upload page + KV mapping + Videy CDN proxy
-// Bind KV: VIDEY_KV
-// Optional env:
-// - VIDEY_UPLOAD_URL = endpoint upload Videy kalau kamu punya API upload-nya
-// - VIDEY_UPLOAD_FIELD = nama field file, default: "file"
+#!/usr/bin/env node
+// index.js - Cloudflare Worker
+// KV binding: VIDEY_KV
+// Optional vars:
+// VIDEY_UPLOAD_URL = "https://videy.co/api/upload"
+// VIDEY_UPLOAD_FIELD = "file"
+// VIDEY_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c"
 
 const UPLOAD_PATH = "/api/upload";
 const API_PREFIX = "/api/";
 const VIDEO_PREFIX = "video:";
-const DEFAULT_UPLOAD_FIELD = "file";
 const CDN_BASE = "https://cdn.videy.co";
+const DEFAULT_UPLOAD_URL = "https://videy.co/api/upload";
+const DEFAULT_UPLOAD_FIELD = "file";
+const DEFAULT_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c";
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
 
       if (pathname === "/") {
-        return htmlResponse(renderHomePage(url, env));
+        return htmlResponse(renderHome(url));
       }
 
       if (pathname === UPLOAD_PATH) {
         if (request.method === "GET") {
-          return htmlResponse(renderUploadPage(url));
+          return htmlResponse(renderUploadPage(url, env));
         }
-
         if (request.method === "POST") {
           return await handleUpload(request, env, url);
         }
-
         return textResponse("Method Not Allowed", 405);
       }
 
-      if (pathname.startsWith(API_PREFIX)) {
-        return await handleApi(request, env, url);
+      if (pathname === "/api/list") {
+        return await handleList(env);
+      }
+
+      if (pathname.startsWith("/api/video/")) {
+        const slug = pathname.replace("/api/video/", "").replace(/\.mp4$/, "");
+        return await handleApiVideo(env, slug);
       }
 
       if (pathname.endsWith(".mp4")) {
-        const slug = pathname.slice(1, -4); // /judul.mp4 -> judul
+        const slug = pathname.slice(1, -4);
         return await serveVideoBySlug(slug, request, env);
       }
 
@@ -53,37 +60,19 @@ export default {
   },
 };
 
-async function handleApi(request, env, url) {
-  const pathname = url.pathname;
-
-  if (pathname.startsWith("/api/video/")) {
-    const slug = pathname.replace("/api/video/", "").replace(/\.mp4$/, "");
-    const key = `${VIDEO_PREFIX}${slug}`;
-    const raw = await env.VIDEY_KV.get(key);
-    if (!raw) return jsonResponse({ ok: false, error: "not_found" }, 404);
-
-    return jsonResponse({ ok: true, data: JSON.parse(raw) });
-  }
-
-  if (pathname === "/api/list") {
-    const items = await listVideos(env, 50);
-    return jsonResponse({ ok: true, items });
-  }
-
-  return jsonResponse({ ok: false, error: "not_found" }, 404);
-}
-
 async function handleUpload(request, env, url) {
   const form = await request.formData();
 
-  const title = normalizeTitle(form.get("title"));
-  const visitorId = normalizeTitle(form.get("visitorId")) || url.searchParams.get("visitorId") || crypto.randomUUID();
-  const customSlug = normalizeTitle(form.get("slug"));
-  const uploadedFile = form.get("video");
-  const videyIdFromForm = normalizeTitle(form.get("videyId"));
+  const title = clean(form.get("title"));
+  const slugInput = clean(form.get("slug"));
+  const visitorIdInput = clean(form.get("visitorId"));
+  const videyIdManual = clean(form.get("videyId"));
+  const file = form.get("video");
+
+  const visitorId = visitorIdInput || env.VIDEY_VISITOR_ID || DEFAULT_VISITOR_ID;
 
   if (!title) {
-    return htmlResponse(renderResultPage({
+    return htmlResponse(renderResult({
       ok: false,
       title: "Upload gagal",
       message: "Judul wajib diisi.",
@@ -91,47 +80,29 @@ async function handleUpload(request, env, url) {
     }), 400);
   }
 
-  let videyId = videyIdFromForm;
+  let videyId = videyIdManual;
 
-  if (!videyId && uploadedFile instanceof File && uploadedFile.size > 0) {
-    const uploadUrl = env.VIDEY_UPLOAD_URL;
-    if (!uploadUrl) {
-      return htmlResponse(renderResultPage({
-        ok: false,
-        title: "Upload gagal",
-        message: "VIDEY_UPLOAD_URL belum diatur. Isi videyId manual atau set endpoint upload Videy.",
-        color: "red",
-      }), 400);
-    }
-
-    videyId = await uploadToVidey(uploadedFile, title, env);
-    if (!videyId) {
-      return htmlResponse(renderResultPage({
-        ok: false,
-        title: "Upload gagal",
-        message: "Worker tidak berhasil mendapatkan ID dari response upload Videy.",
-        color: "red",
-      }), 500);
-    }
+  if (!videyId && file instanceof File && file.size > 0) {
+    videyId = await uploadToVidey(file, env, visitorId, title);
   }
 
   if (!videyId) {
-    return htmlResponse(renderResultPage({
+    return htmlResponse(renderResult({
       ok: false,
       title: "Upload gagal",
-      message: "Isi videyId manual atau unggah file jika VIDEY_UPLOAD_URL sudah dipasang.",
+      message: "Isi videyId manual atau unggah file supaya Worker bisa meneruskan upload ke Videy.",
       color: "red",
     }), 400);
   }
 
-  const baseSlug = customSlug || slugify(title);
-  const slug = await ensureUniqueSlug(env, baseSlug);
+  const baseSlug = slugInput || slugify(title);
+  const slug = await uniqueSlug(env, baseSlug);
 
   const record = {
     title,
     slug,
-    visitorId,
     videyId,
+    visitorId,
     createdAt: new Date().toISOString(),
   };
 
@@ -140,58 +111,98 @@ async function handleUpload(request, env, url) {
   const publicUrl = `${url.origin}/${slug}.mp4`;
   const apiUrl = `${url.origin}/api/video/${slug}`;
 
-  return htmlResponse(renderResultPage({
+  return htmlResponse(renderResult({
     ok: true,
     title: "Upload sukses",
-    message: "Judul sudah disimpan di KV dan link publik sudah siap.",
-    data: {
-      publicUrl,
-      apiUrl,
-      slug,
-      videyId,
-      visitorId,
-    },
+    message: "Judul sudah masuk KV, link publik siap dipakai.",
+    data: { publicUrl, apiUrl, slug, videyId, visitorId },
     color: "green",
   }));
 }
 
+async function uploadToVidey(file, env, visitorId, title) {
+  const uploadUrl = env.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
+  const fieldName = env.VIDEY_UPLOAD_FIELD || DEFAULT_UPLOAD_FIELD;
+
+  const mime = file.type || "application/octet-stream";
+
+  const fd = new FormData();
+  fd.append(fieldName, file, file.name || `${slugify(title)}.mp4`);
+  fd.append("title", title);
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 15; Termux) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://videy.co",
+    "Referer": "https://videy.co/",
+    "X-Requested-With": "XMLHttpRequest",
+  };
+
+  const resp = await fetch(`${uploadUrl}?visitorId=${encodeURIComponent(visitorId)}`, {
+    method: "POST",
+    headers,
+    body: fd,
+    redirect: "follow",
+  });
+
+  const ct = resp.headers.get("content-type") || "";
+  let data = null;
+  let text = "";
+
+  if (ct.includes("application/json")) {
+    try {
+      data = await resp.json();
+    } catch {
+      data = null;
+    }
+  } else {
+    try {
+      text = await resp.text();
+    } catch {
+      text = "";
+    }
+  }
+
+  const videyId =
+    extractIdFromJson(data) ||
+    extractIdFromText(text) ||
+    extractIdFromText(JSON.stringify(data || {})) ||
+    extractIdFromText(resp.headers.get("location") || "");
+
+  return videyId;
+}
+
 async function serveVideoBySlug(slug, request, env) {
-  const key = `${VIDEO_PREFIX}${slug}`;
-  const raw = await env.VIDEY_KV.get(key);
+  const raw = await env.VIDEY_KV.get(`${VIDEO_PREFIX}${slug}`);
+  if (!raw) return textResponse("Video tidak ditemukan", 404);
 
-  if (!raw) {
-    return textResponse("Video tidak ditemukan", 404);
+  let meta;
+  try {
+    meta = JSON.parse(raw);
+  } catch {
+    return textResponse("Data KV rusak", 500);
   }
 
-  const meta = JSON.parse(raw);
-  const videyId = meta.videyId;
+  if (!meta?.videyId) return textResponse("videyId kosong", 500);
 
-  if (!videyId) {
-    return textResponse("Mapping video rusak: videyId kosong", 500);
-  }
+  const upstreamUrl = `${CDN_BASE}/${encodeURIComponent(meta.videyId)}.mp4`;
 
-  const upstreamUrl = `${CDN_BASE}/${encodeURIComponent(videyId)}.mp4`;
   const upstreamHeaders = new Headers();
+  copyHeader(request.headers, upstreamHeaders, "Range");
+  copyHeader(request.headers, upstreamHeaders, "If-Range");
+  copyHeader(request.headers, upstreamHeaders, "Accept");
+  copyHeader(request.headers, upstreamHeaders, "User-Agent");
+  copyHeader(request.headers, upstreamHeaders, "Referer");
+  copyHeader(request.headers, upstreamHeaders, "Origin");
 
-  const range = request.headers.get("Range");
-  if (range) upstreamHeaders.set("Range", range);
-
-  const ifRange = request.headers.get("If-Range");
-  if (ifRange) upstreamHeaders.set("If-Range", ifRange);
-
-  const accept = request.headers.get("Accept");
-  if (accept) upstreamHeaders.set("Accept", accept);
-
-  const userAgent = request.headers.get("User-Agent");
-  if (userAgent) upstreamHeaders.set("User-Agent", userAgent);
-
-  const fetchResp = await fetch(upstreamUrl, {
+  const upstreamResp = await fetch(upstreamUrl, {
     method: "GET",
     headers: upstreamHeaders,
     redirect: "follow",
   });
 
-  const headers = new Headers(fetchResp.headers);
+  const headers = new Headers(upstreamResp.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Cache-Control", "public, max-age=3600");
   headers.set("X-Video-Slug", slug);
@@ -201,84 +212,47 @@ async function serveVideoBySlug(slug, request, env) {
     headers.set("Content-Type", "video/mp4");
   }
 
-  return new Response(fetchResp.body, {
-    status: fetchResp.status,
-    statusText: fetchResp.statusText,
+  return new Response(upstreamResp.body, {
+    status: upstreamResp.status,
+    statusText: upstreamResp.statusText,
     headers,
   });
 }
 
-async function uploadToVidey(file, title, env) {
-  const uploadUrl = env.VIDEY_UPLOAD_URL;
-  const fieldName = env.VIDEY_UPLOAD_FIELD || DEFAULT_UPLOAD_FIELD;
-
-  const fd = new FormData();
-  fd.append(fieldName, file, file.name || `${slugify(title)}.mp4`);
-  fd.append("title", title);
-
-  const resp = await fetch(uploadUrl, {
-    method: "POST",
-    body: fd,
-  });
-
-  const contentType = resp.headers.get("content-type") || "";
-
-  if (contentType.includes("application/json")) {
-    const json = await resp.json().catch(() => null);
-    if (!json) return null;
-
-    return (
-      json.id ||
-      json.videoId ||
-      json.fileId ||
-      json.data?.id ||
-      json.data?.videoId ||
-      extractIdFromString(JSON.stringify(json))
-    );
-  }
-
-  const text = await resp.text().catch(() => "");
-  const id = extractIdFromString(text);
-  if (id) return id;
-
-  const location = resp.headers.get("location");
-  if (location) {
-    const locId = extractIdFromString(location);
-    if (locId) return locId;
-  }
-
-  return null;
+async function handleApiVideo(env, slug) {
+  const raw = await env.VIDEY_KV.get(`${VIDEO_PREFIX}${slug}`);
+  if (!raw) return jsonResponse({ ok: false, error: "not_found" }, 404);
+  return jsonResponse({ ok: true, data: JSON.parse(raw) });
 }
 
-async function listVideos(env, limit = 50) {
+async function handleList(env) {
   const out = [];
-  const res = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit });
+  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 100 });
 
-  for (const item of res.keys) {
-    const raw = await env.VIDEY_KV.get(item.name);
+  for (const key of result.keys) {
+    const raw = await env.VIDEY_KV.get(key.name);
     if (!raw) continue;
     try {
       out.push(JSON.parse(raw));
     } catch {
-      // skip
+      continue;
     }
   }
 
   out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  return out;
+  return jsonResponse({ ok: true, items: out });
 }
 
-async function ensureUniqueSlug(env, slug) {
-  const base = slug || `video-${Date.now()}`;
-  let current = base;
+async function uniqueSlug(env, base) {
+  let slug = base || `video-${Date.now()}`;
   let i = 0;
 
-  while (await env.VIDEY_KV.get(`${VIDEO_PREFIX}${current}`)) {
+  while (await env.VIDEY_KV.get(`${VIDEO_PREFIX}${slug}`)) {
     i += 1;
-    current = `${base}-${i}`;
+    slug = `${base}-${i}`;
   }
 
-  return current;
+  return slug;
 }
 
 function slugify(input) {
@@ -291,14 +265,33 @@ function slugify(input) {
     .slice(0, 80) || `video-${Date.now()}`;
 }
 
-function extractIdFromString(text) {
+function clean(v) {
+  return String(v ?? "").trim();
+}
+
+function extractIdFromJson(data) {
+  if (!data || typeof data !== "object") return null;
+  return (
+    data.id ||
+    data.videoId ||
+    data.fileId ||
+    data.data?.id ||
+    data.data?.videoId ||
+    data.data?.fileId ||
+    null
+  );
+}
+
+function extractIdFromText(text) {
   if (!text) return null;
-  const m = String(text).match(/([A-Za-z0-9_-]{5,})/);
+  const s = String(text);
+  const m = s.match(/([A-Za-z0-9_-]{5,})/);
   return m ? m[1] : null;
 }
 
-function normalizeTitle(value) {
-  return String(value || "").trim();
+function copyHeader(src, dst, name) {
+  const val = src.get(name);
+  if (val) dst.set(name, val);
 }
 
 function htmlResponse(html, status = 200) {
@@ -340,7 +333,7 @@ function escapeHtml(s) {
     .replaceAll("'", "&#39;");
 }
 
-function renderHomePage(url, env) {
+function renderHome(url) {
   return `<!doctype html>
 <html lang="id">
 <head>
@@ -348,44 +341,28 @@ function renderHomePage(url, env) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MyBlobVidey</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.5}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:820px;margin:40px auto;padding:0 16px;line-height:1.5}
+    .box{border:1px solid #ddd;border-radius:12px;padding:16px}
     a{color:#2563eb;text-decoration:none}
-    .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}
     code{background:#f4f4f5;padding:2px 6px;border-radius:6px}
-    ul{padding-left:18px}
-    small{color:#666}
   </style>
 </head>
 <body>
   <h1>MyBlobVidey</h1>
-  <p>Minimal proxy + KV title mapper.</p>
-
-  <div class="card">
-    <div><a href="/api/upload?visitorId=${encodeURIComponent(url.searchParams.get("visitorId") || "")}">Buka upload</a></div>
-    <div><a href="/api/list">Lihat daftar JSON</a></div>
+  <div class="box">
+    <p>Minimal proxy + KV mapper.</p>
+    <p><a href="/api/upload?visitorId=${encodeURIComponent(url.searchParams.get("visitorId") || "")}">Buka uploader</a></p>
+    <p><a href="/api/list">Lihat JSON list</a></p>
+    <p>Link publik: <code>${escapeHtml(url.origin)}/judul-video.mp4</code></p>
   </div>
-
-  <div class="card">
-    <strong>Format link:</strong><br>
-    <code>${escapeHtml(url.origin)}/judul-video.mp4</code>
-  </div>
-
-  <div class="card">
-    <strong>Konfigurasi:</strong>
-    <ul>
-      <li>KV binding: <code>VIDEY_KV</code></li>
-      <li>Optional: <code>VIDEY_UPLOAD_URL</code></li>
-      <li>Optional: <code>VIDEY_UPLOAD_FIELD=file</code></li>
-    </ul>
-  </div>
-
-  <small>Worker ini minimalis, polos, dan langsung jalan.</small>
 </body>
 </html>`;
 }
 
-function renderUploadPage(url) {
-  const visitorId = url.searchParams.get("visitorId") || "";
+function renderUploadPage(url, env) {
+  const visitorId = clean(url.searchParams.get("visitorId")) || env.VIDEY_VISITOR_ID || DEFAULT_VISITOR_ID;
+  const uploadUrl = env.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
+
   return `<!doctype html>
 <html lang="id">
 <head>
@@ -393,47 +370,45 @@ function renderUploadPage(url) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Upload Videy</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.5}
-    label{display:block;margin:10px 0 6px}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.5}
+    .box{border:1px solid #ddd;border-radius:12px;padding:16px}
+    label{display:block;margin:12px 0 6px}
     input,button{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:10px;font:inherit}
     button{cursor:pointer;background:#111;color:#fff;border:none;margin-top:14px}
-    .box{border:1px solid #ddd;border-radius:12px;padding:16px}
     small{color:#666}
+    code{background:#f4f4f5;padding:2px 6px;border-radius:6px}
   </style>
 </head>
 <body>
-  <h1>Upload</h1>
+  <h1>Uploader</h1>
   <div class="box">
     <form method="POST" enctype="multipart/form-data">
-      <label>Title</label>
+      <label>Judul</label>
       <input name="title" required placeholder="contoh: kucing-lucu">
 
-      <label>Slug custom (opsional)</label>
+      <label>Slug custom</label>
       <input name="slug" placeholder="kucing-lucu">
 
-      <label>Videy ID manual (opsional)</label>
+      <label>Videy ID manual</label>
       <input name="videyId" placeholder="A8sjKd92">
 
-      <label>File video (opsional jika VIDEY_UPLOAD_URL sudah diatur)</label>
+      <label>File video</label>
       <input type="file" name="video" accept="video/*">
 
-      <input type="hidden" name="visitorId" value="${escapeHtml(visitorId)}">
+      <label>visitorId</label>
+      <input name="visitorId" value="${escapeHtml(visitorId)}">
 
       <button type="submit">Upload</button>
     </form>
   </div>
-  <p><small>Kalau kamu belum punya endpoint upload Videy, isi <code>videyId</code> manual dulu.</small></p>
+
+  <p><small>Endpoint upload: <code>${escapeHtml(uploadUrl)}</code></small></p>
+  <p><small>Kalau kamu ingin pola seperti Termux, ini sudah pakai <code>visitorId</code>, <code>Origin</code>, <code>Referer</code>, dan field <code>file</code>.</small></p>
 </body>
 </html>`;
 }
 
-function renderResultPage({ ok, title, message, data = null, color = "black" }) {
-  const dataHtml = data
-    ? `<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:12px;border-radius:12px;overflow:auto">${escapeHtml(
-        JSON.stringify(data, null, 2)
-      )}</pre>`
-    : "";
-
+function renderResult({ ok, title, message, data = null, color = "black" }) {
   return `<!doctype html>
 <html lang="id">
 <head>
@@ -443,15 +418,15 @@ function renderResultPage({ ok, title, message, data = null, color = "black" }) 
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.5}
     .box{border:1px solid #ddd;border-radius:12px;padding:16px}
+    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:12px;border-radius:12px;overflow:auto}
     a{color:#2563eb;text-decoration:none}
-    code{background:#f4f4f5;padding:2px 6px;border-radius:6px}
   </style>
 </head>
 <body>
   <h1 style="color:${color}">${escapeHtml(title)}</h1>
   <div class="box">
     <p>${escapeHtml(message)}</p>
-    ${dataHtml}
+    ${data ? `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>` : ""}
     <p><a href="/api/upload">Kembali</a> | <a href="/">Beranda</a></p>
   </div>
 </body>
