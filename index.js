@@ -1,18 +1,9 @@
 // index.js
-// Cloudflare Worker for Videy proxy + KV title mapping
-// KV binding: VIDEY_KV
-// Optional vars:
-// VIDEY_UPLOAD_URL = "https://videy.co/api/upload"
-// VIDEY_UPLOAD_FIELD = "file"
-// VIDEY_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c"
-
 const UPLOAD_PATH = "/api/upload";
-const API_PREFIX = "/api/";
 const VIDEO_PREFIX = "video:";
 const CDN_BASE = "https://cdn.videy.co";
-const DEFAULT_UPLOAD_URL = "https://videy.co/api/upload";
-const DEFAULT_UPLOAD_FIELD = "file";
 const DEFAULT_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c";
+const DEFAULT_UPLOAD_URL = "https://videy.co/api/upload";
 
 export default {
   async fetch(request, env) {
@@ -26,7 +17,7 @@ export default {
 
       if (pathname === UPLOAD_PATH) {
         if (request.method === "GET") {
-          return htmlResponse(renderUploadPage(url, env));
+          return htmlResponse(renderUploadPage(url));
         }
         if (request.method === "POST") {
           return await handleUpload(request, env, url);
@@ -39,7 +30,7 @@ export default {
       }
 
       if (pathname.startsWith("/api/video/")) {
-        const slug = pathname.replace("/api/video/", "").replace(/\.mp4$/, "");
+        const slug = pathname.slice("/api/video/".length).replace(/\.mp4$/i, "");
         return await handleApiVideo(env, slug);
       }
 
@@ -62,19 +53,12 @@ export default {
 
 async function handleUpload(request, env, url) {
   const form = await request.formData();
-
   const title = clean(form.get("title"));
-  const slugInput = clean(form.get("slug"));
-  const visitorIdInput = clean(form.get("visitorId"));
-  const manualVideyId = clean(form.get("videyId"));
-  const file = form.get("video");
-
-  const visitorId = visitorIdInput || env.VIDEY_VISITOR_ID || DEFAULT_VISITOR_ID;
+  const file = form.get("file");
 
   if (!title) {
     return htmlResponse(
       renderResult({
-        ok: false,
         title: "Upload gagal",
         message: "Judul wajib diisi.",
         color: "red",
@@ -83,35 +67,43 @@ async function handleUpload(request, env, url) {
     );
   }
 
-  let videyId = manualVideyId;
-  let rawUploadDebug = null;
-
-  if (!videyId && file instanceof File && file.size > 0) {
-    const uploadResult = await uploadToVidey(file, env, visitorId, title);
-    videyId = uploadResult.videyId;
-    rawUploadDebug = uploadResult.debug;
-  }
-
-  if (!videyId) {
+  if (!(file instanceof File) || file.size <= 0) {
     return htmlResponse(
       renderResult({
-        ok: false,
         title: "Upload gagal",
-        message: "ID Videy tidak ditemukan dari response upload. Tidak menyimpan data palsu.",
+        message: "File video wajib dipilih.",
         color: "red",
-        data: rawUploadDebug ? { uploadDebug: rawUploadDebug } : null,
+      }),
+      400
+    );
+  }
+
+  const visitorId = DEFAULT_VISITOR_ID;
+  const uploadResult = await uploadToVidey(file, visitorId);
+
+  if (!uploadResult.ok) {
+    return htmlResponse(
+      renderResult({
+        title: "Upload gagal",
+        message: "Videy tidak mengembalikan ID video yang valid. Tidak ada data yang disimpan ke KV.",
+        data: {
+          status: uploadResult.status,
+          contentType: uploadResult.contentType,
+          location: uploadResult.location,
+          rawJson: uploadResult.rawJson,
+          rawText: uploadResult.rawText,
+        },
+        color: "red",
       }),
       502
     );
   }
 
-  const baseSlug = slugInput || slugify(title);
-  const slug = await uniqueSlug(env, baseSlug);
-
+  const slug = await uniqueSlug(env, slugify(title));
   const record = {
     title,
     slug,
-    videyId,
+    videyId: uploadResult.videyId,
     visitorId,
     createdAt: new Date().toISOString(),
   };
@@ -123,14 +115,13 @@ async function handleUpload(request, env, url) {
 
   return htmlResponse(
     renderResult({
-      ok: true,
       title: "Upload sukses",
-      message: "Judul tersimpan di KV, dan ID Videy berhasil dipakai.",
+      message: "ID asli Videy berhasil disimpan ke KV.",
       data: {
         publicUrl,
         apiUrl,
         slug,
-        videyId,
+        videyId: uploadResult.videyId,
         visitorId,
       },
       color: "green",
@@ -138,38 +129,25 @@ async function handleUpload(request, env, url) {
   );
 }
 
-async function uploadToVidey(file, env, visitorId, title) {
-  const uploadUrl = env.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
-  const fieldName = env.VIDEY_UPLOAD_FIELD || DEFAULT_UPLOAD_FIELD;
-
+async function uploadToVidey(file, visitorId) {
+  const uploadUrl = DEFAULT_UPLOAD_URL;
   const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Linux; Android 15; Termux) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
-    Accept: "application/json, text/plain, */*",
-    Origin: "https://videy.co",
-    Referer: "https://videy.co/",
-    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": "Mozilla/5.0",
+    Accept: "application/json",
   };
 
-  const fd = new FormData();
-  fd.append(fieldName, file, file.name || `${slugify(title)}.mp4`);
-  fd.append("title", title);
+  const formData = new FormData();
+  formData.append("file", file, file.name || "video.mp4");
 
   const resp = await fetch(`${uploadUrl}?visitorId=${encodeURIComponent(visitorId)}`, {
     method: "POST",
     headers,
-    body: fd,
+    body: formData,
     redirect: "follow",
   });
 
   const contentType = resp.headers.get("content-type") || "";
-  const debug = {
-    status: resp.status,
-    contentType,
-    location: resp.headers.get("location") || "",
-    rawText: "",
-    rawJson: null,
-  };
+  const location = resp.headers.get("location") || "";
 
   let rawText = "";
   let rawJson = null;
@@ -177,14 +155,12 @@ async function uploadToVidey(file, env, visitorId, title) {
   if (contentType.includes("application/json")) {
     try {
       rawJson = await resp.json();
-      debug.rawJson = rawJson;
     } catch {
       rawJson = null;
     }
   } else {
     try {
       rawText = await resp.text();
-      debug.rawText = rawText.slice(0, 2000);
     } catch {
       rawText = "";
     }
@@ -194,10 +170,17 @@ async function uploadToVidey(file, env, visitorId, title) {
     extractIdFromJson(rawJson) ||
     extractIdFromText(rawText) ||
     extractIdFromText(JSON.stringify(rawJson || {})) ||
-    extractIdFromText(resp.headers.get("location") || "") ||
-    null;
+    extractIdFromText(location);
 
-  return { videyId, debug };
+  return {
+    ok: Boolean(videyId),
+    videyId: videyId || null,
+    status: resp.status,
+    contentType,
+    location,
+    rawJson,
+    rawText: rawText ? rawText.slice(0, 4000) : "",
+  };
 }
 
 async function serveVideoBySlug(slug, request, env) {
@@ -211,17 +194,19 @@ async function serveVideoBySlug(slug, request, env) {
     return textResponse("Data KV rusak", 500);
   }
 
-  if (!meta?.videyId) return textResponse("videyId kosong", 500);
+  if (!meta?.videyId) {
+    return textResponse("videyId kosong", 500);
+  }
 
   const upstreamUrl = `${CDN_BASE}/${encodeURIComponent(meta.videyId)}.mp4`;
-
   const upstreamHeaders = new Headers();
+
   copyHeader(request.headers, upstreamHeaders, "Range");
   copyHeader(request.headers, upstreamHeaders, "If-Range");
   copyHeader(request.headers, upstreamHeaders, "Accept");
   copyHeader(request.headers, upstreamHeaders, "User-Agent");
-  copyHeader(request.headers, upstreamHeaders, "Referer");
   copyHeader(request.headers, upstreamHeaders, "Origin");
+  copyHeader(request.headers, upstreamHeaders, "Referer");
 
   const upstreamResp = await fetch(upstreamUrl, {
     method: "GET",
@@ -250,14 +235,11 @@ async function handleApiVideo(env, slug) {
   const raw = await env.VIDEY_KV.get(`${VIDEO_PREFIX}${slug}`);
   if (!raw) return jsonResponse({ ok: false, error: "not_found" }, 404);
 
-  let data;
   try {
-    data = JSON.parse(raw);
+    return jsonResponse({ ok: true, data: JSON.parse(raw) });
   } catch {
     return jsonResponse({ ok: false, error: "bad_data" }, 500);
   }
-
-  return jsonResponse({ ok: true, data });
 }
 
 async function handleList(env) {
@@ -393,15 +375,6 @@ function textResponse(text, status = 200) {
   });
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 function renderHome(url) {
   return `<!doctype html>
 <html lang="id">
@@ -419,8 +392,7 @@ function renderHome(url) {
 <body>
   <h1>MyBlobVidey</h1>
   <div class="box">
-    <p>Minimal proxy + KV mapper.</p>
-    <p><a href="/api/upload?visitorId=${encodeURIComponent(url.searchParams.get("visitorId") || "")}">Buka uploader</a></p>
+    <p><a href="/api/upload">Buka uploader</a></p>
     <p><a href="/api/list">Lihat JSON list</a></p>
     <p>Link publik: <code>${escapeHtml(url.origin)}/judul-video.mp4</code></p>
   </div>
@@ -428,10 +400,7 @@ function renderHome(url) {
 </html>`;
 }
 
-function renderUploadPage(url, env) {
-  const visitorId = clean(url.searchParams.get("visitorId")) || env.VIDEY_VISITOR_ID || DEFAULT_VISITOR_ID;
-  const uploadUrl = env.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
-
+function renderUploadPage() {
   return `<!doctype html>
 <html lang="id">
 <head>
@@ -445,7 +414,6 @@ function renderUploadPage(url, env) {
     input,button{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:10px;font:inherit}
     button{cursor:pointer;background:#111;color:#fff;border:none;margin-top:14px}
     small{color:#666}
-    code{background:#f4f4f5;padding:2px 6px;border-radius:6px}
   </style>
 </head>
 <body>
@@ -455,29 +423,18 @@ function renderUploadPage(url, env) {
       <label>Judul</label>
       <input name="title" required placeholder="contoh: kucing-lucu">
 
-      <label>Slug custom</label>
-      <input name="slug" placeholder="kucing-lucu">
-
-      <label>Videy ID manual</label>
-      <input name="videyId" placeholder="A8sjKd92">
-
       <label>File video</label>
-      <input type="file" name="video" accept="video/*">
-
-      <label>visitorId</label>
-      <input name="visitorId" value="${escapeHtml(visitorId)}">
+      <input type="file" name="file" accept="video/*" required>
 
       <button type="submit">Upload</button>
     </form>
   </div>
-
-  <p><small>Endpoint upload: <code>${escapeHtml(uploadUrl)}</code></small></p>
-  <p><small>Worker ini hanya menyimpan ID asli dari Videy. Kalau response upload tidak berisi ID, data tidak disimpan.</small></p>
+  <p><small>Field upload hanya <code>title</code> dan <code>file</code>. ID hanya diambil dari respons resmi Videy.</small></p>
 </body>
 </html>`;
 }
 
-function renderResult({ ok, title, message, data = null, color = "black" }) {
+function renderResult({ title, message, data = null, color = "black" }) {
   return `<!doctype html>
 <html lang="id">
 <head>
