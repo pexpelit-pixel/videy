@@ -17,11 +17,13 @@ export default {
 
       if (pathname === UPLOAD_PATH) {
         if (request.method === "GET") {
-          return htmlResponse(renderUploadPage(url));
+          return htmlResponse(renderUploadPage());
         }
+
         if (request.method === "POST") {
           return await handleUpload(request, env, url);
         }
+
         return textResponse("Method Not Allowed", 405);
       }
 
@@ -53,6 +55,7 @@ export default {
 
 async function handleUpload(request, env, url) {
   const form = await request.formData();
+
   const title = clean(form.get("title"));
   const file = form.get("file");
 
@@ -79,19 +82,19 @@ async function handleUpload(request, env, url) {
   }
 
   const visitorId = DEFAULT_VISITOR_ID;
-  const uploadResult = await uploadToVidey(file, visitorId);
+  const upload = await uploadToVidey(file, visitorId);
 
-  if (!uploadResult.ok) {
+  if (!upload.ok) {
     return htmlResponse(
       renderResult({
         title: "Upload gagal",
         message: "Videy tidak mengembalikan ID video yang valid. Tidak ada data yang disimpan ke KV.",
         data: {
-          status: uploadResult.status,
-          contentType: uploadResult.contentType,
-          location: uploadResult.location,
-          rawJson: uploadResult.rawJson,
-          rawText: uploadResult.rawText,
+          status: upload.status,
+          contentType: upload.contentType,
+          location: upload.location,
+          rawJson: upload.rawJson,
+          rawText: upload.rawText,
         },
         color: "red",
       }),
@@ -103,7 +106,7 @@ async function handleUpload(request, env, url) {
   const record = {
     title,
     slug,
-    videyId: uploadResult.videyId,
+    videyId: upload.videyId,
     visitorId,
     createdAt: new Date().toISOString(),
   };
@@ -121,7 +124,7 @@ async function handleUpload(request, env, url) {
         publicUrl,
         apiUrl,
         slug,
-        videyId: uploadResult.videyId,
+        videyId: upload.videyId,
         visitorId,
       },
       color: "green",
@@ -131,6 +134,7 @@ async function handleUpload(request, env, url) {
 
 async function uploadToVidey(file, visitorId) {
   const uploadUrl = DEFAULT_UPLOAD_URL;
+
   const headers = {
     "User-Agent": "Mozilla/5.0",
     Accept: "application/json",
@@ -170,11 +174,12 @@ async function uploadToVidey(file, visitorId) {
     extractIdFromJson(rawJson) ||
     extractIdFromText(rawText) ||
     extractIdFromText(JSON.stringify(rawJson || {})) ||
-    extractIdFromText(location);
+    extractIdFromText(location) ||
+    null;
 
   return {
     ok: Boolean(videyId),
-    videyId: videyId || null,
+    videyId,
     status: resp.status,
     contentType,
     location,
@@ -194,13 +199,11 @@ async function serveVideoBySlug(slug, request, env) {
     return textResponse("Data KV rusak", 500);
   }
 
-  if (!meta?.videyId) {
-    return textResponse("videyId kosong", 500);
-  }
+  if (!meta?.videyId) return textResponse("videyId kosong", 500);
 
   const upstreamUrl = `${CDN_BASE}/${encodeURIComponent(meta.videyId)}.mp4`;
-  const upstreamHeaders = new Headers();
 
+  const upstreamHeaders = new Headers();
   copyHeader(request.headers, upstreamHeaders, "Range");
   copyHeader(request.headers, upstreamHeaders, "If-Range");
   copyHeader(request.headers, upstreamHeaders, "Accept");
@@ -318,6 +321,7 @@ function extractIdFromJson(data) {
 
 function extractIdFromText(text) {
   if (!text) return null;
+
   const s = String(text);
 
   const patterns = [
@@ -373,6 +377,15 @@ function textResponse(text, status = 200) {
       "cache-control": "no-store",
     },
   });
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function renderHome(url) {
