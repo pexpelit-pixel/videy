@@ -1,0 +1,11 @@
+name = "myblobvidey"
+main = "./index.js"
+compatibility_date = "2026-07-04"
+
+[[kv_namespaces]]
+binding = "VIDEY_KV"
+id = "3dbd9d9a51a148eda93ada8615670e20"
+
+[vars]
+VIDEY_UPLOAD_URL = "https://api.videy.co/api/upload?visitorId=1f5f718b-06b2-40f9-82da-0a73dfdadd1c"
+VIDEY_UPLOAD_FIELD = "file"
