@@ -11,6 +11,12 @@ const D1_VIDEOS_TABLE = "videy_videos";
 const D1_COUNTERS_TABLE = "videy_counters";
 const D1_COUNTER_NAME = "video_order";
 
+const DEFAULT_LIST_LIMIT = 100;
+const MAX_LIST_LIMIT = 200;
+const DEFAULT_LEGACY_LIMIT = 100;
+const MAX_LEGACY_LIMIT = 200;
+const DEFAULT_KV_MIRROR = false;
+
 export default {
   async fetch(request, env) {
     try {
@@ -34,7 +40,14 @@ export default {
       }
 
       if (pathname === "/api/list") {
-        return await handleList(env);
+        if ((url.searchParams.get("source") || "").toLowerCase() === "kv") {
+          return await handleLegacyList(env, url);
+        }
+        return await handleList(env, url);
+      }
+
+      if (pathname === "/api/list/legacy") {
+        return await handleLegacyList(env, url);
       }
 
       if (pathname.startsWith("/api/video/")) {
@@ -79,6 +92,15 @@ async function ensureD1Schema(env) {
   return true;
 }
 
+function shouldMirrorKv(env) {
+  const raw = env?.VIDEY_KV_WRITE_ENABLED;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") {
+    return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
+  }
+  return DEFAULT_KV_MIRROR;
+}
+
 function isUniqueConstraintError(err) {
   const msg = String(err?.message || err || "");
   return /UNIQUE constraint failed|constraint failed|PRIMARY KEY constraint failed/i.test(msg);
@@ -98,6 +120,32 @@ function normalizeRecord(record) {
     videyId: record.videyId ?? record.videy_id ?? null,
     sourceUrl: record.sourceUrl ?? record.source_url ?? null,
   };
+}
+
+function parsePositiveInt(value, fallback) {
+  const n = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function clampInt(value, fallback, min, max) {
+  const n = parsePositiveInt(value, fallback);
+  return Math.min(max, Math.max(min, n));
+}
+
+function parsePagination(url, defaultLimit, maxLimit) {
+  const page = clampInt(url.searchParams.get("page"), 1, 1, 1000000);
+  const limit = clampInt(url.searchParams.get("limit"), defaultLimit, 1, maxLimit);
+  return {
+    page,
+    limit,
+    offset: (page - 1) * limit,
+  };
+}
+
+function parseKvPagination(url) {
+  const limit = clampInt(url.searchParams.get("limit"), DEFAULT_LEGACY_LIMIT, 1, MAX_LEGACY_LIMIT);
+  const cursor = clean(url.searchParams.get("cursor"));
+  return { limit, cursor: cursor || null };
 }
 
 async function getMaxOrderFromKv(env) {
@@ -267,11 +315,13 @@ async function handleUpload(request, env, url) {
 
     let kvMirrored = false;
     let kvError = "";
-    try {
-      await env.VIDEY_KV.put(key, JSON.stringify(payload));
-      kvMirrored = true;
-    } catch (err) {
-      kvError = err?.message || String(err);
+    if (shouldMirrorKv(env) && env?.VIDEY_KV) {
+      try {
+        await env.VIDEY_KV.put(key, JSON.stringify(payload));
+        kvMirrored = true;
+      } catch (err) {
+        kvError = err?.message || String(err);
+      }
     }
 
     return respondUploadSuccess(
@@ -284,7 +334,9 @@ async function handleUpload(request, env, url) {
         title,
         message: kvMirrored
           ? (saved.storedInD1 ? "Proxy link tersimpan di D1 dan KV." : "Proxy link tersimpan di KV.")
-          : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError}`,
+          : saved.storedInD1
+            ? "Proxy link tersimpan di D1."
+            : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`,
         storage: {
           d1: !!saved.storedInD1,
           kv: kvMirrored,
@@ -342,11 +394,13 @@ async function handleUpload(request, env, url) {
 
   let kvMirrored = false;
   let kvError = "";
-  try {
-    await env.VIDEY_KV.put(key, JSON.stringify(payload));
-    kvMirrored = true;
-  } catch (err) {
-    kvError = err?.message || String(err);
+  if (shouldMirrorKv(env) && env?.VIDEY_KV) {
+    try {
+      await env.VIDEY_KV.put(key, JSON.stringify(payload));
+      kvMirrored = true;
+    } catch (err) {
+      kvError = err?.message || String(err);
+    }
   }
 
   return respondUploadSuccess(
@@ -360,7 +414,9 @@ async function handleUpload(request, env, url) {
       videyId: upload.videyId,
       message: kvMirrored
         ? (saved.storedInD1 ? "ID asli Videy berhasil disimpan ke D1 dan KV." : "ID asli Videy berhasil disimpan ke KV.")
-        : `ID asli Videy berhasil disimpan ke D1, mirror KV gagal: ${kvError}`,
+        : saved.storedInD1
+          ? "ID asli Videy berhasil disimpan ke D1."
+          : `ID asli Videy berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`,
       storage: {
         d1: !!saved.storedInD1,
         kv: kvMirrored,
@@ -555,62 +611,99 @@ async function handleApiVideo(env, order, slug) {
   });
 }
 
-async function handleList(env) {
-  const out = [];
-  const seen = new Set();
-
+async function handleList(env, url) {
   const db = getD1(env);
-  if (db) {
-    await ensureD1Schema(env);
-    const result = await db
-      .prepare(
-        `SELECT
-          order_num AS order_num,
-          slug,
-          title,
-          mode,
-          videy_id AS videyId,
-          source_url AS sourceUrl,
-          created_at AS createdAt
-         FROM ${D1_VIDEOS_TABLE}`
-      )
-      .all();
-
-    const rows = result?.results || [];
-    for (const row of rows) {
-      const record = normalizeRecord(row);
-      const key = `${String(record.order ?? "")}:${String(record.slug ?? "")}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(publicRecord(record));
-    }
+  if (!db) {
+    return jsonResponse({ ok: false, error: "d1_not_available" }, 503);
   }
 
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
+  await ensureD1Schema(env);
 
-  for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
+  const { page, limit, offset } = parsePagination(url, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+
+  const result = await db
+    .prepare(
+      `SELECT
+        order_num AS order_num,
+        slug,
+        title,
+        mode,
+        videy_id AS videyId,
+        source_url AS sourceUrl,
+        created_at AS createdAt
+       FROM ${D1_VIDEOS_TABLE}
+       ORDER BY order_num ASC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(limit + 1, offset)
+    .all();
+
+  const rows = result?.results || [];
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit).map((row) => publicRecord(normalizeRecord(row)));
+
+  return jsonResponse({
+    ok: true,
+    source: "d1",
+    page,
+    limit,
+    hasMore,
+    nextPage: hasMore ? page + 1 : null,
+    items,
+  });
+}
+
+async function handleLegacyList(env, url) {
+  const kv = env?.VIDEY_KV;
+  if (!kv) {
+    return jsonResponse({ ok: false, error: "kv_not_available" }, 503);
+  }
+
+  const { limit, cursor } = parseKvPagination(url);
+
+  const listArgs = {
+    prefix: VIDEO_PREFIX,
+    limit: limit + 1,
+  };
+
+  if (cursor) {
+    listArgs.cursor = cursor;
+  }
+
+  const result = await kv.list(listArgs);
+  const keys = result?.keys || [];
+  const hasMore = keys.length > limit;
+  const pageKeys = keys.slice(0, limit);
+
+  const items = [];
+  for (const key of pageKeys) {
+    const raw = await kv.get(key.name);
     if (!raw) continue;
+
     try {
       const record = JSON.parse(raw);
-      const norm = normalizeRecord(record);
-      const dedupeKey = `${String(norm.order ?? "")}:${String(norm.slug ?? "")}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      out.push(publicRecord(norm));
+      items.push(publicRecord(normalizeRecord(record)));
     } catch {
       continue;
     }
   }
 
-  out.sort((a, b) => {
+  items.sort((a, b) => {
     const ao = Number(a.order || 0);
     const bo = Number(b.order || 0);
     if (ao !== bo) return ao - bo;
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
 
-  return jsonResponse({ ok: true, items: out });
+  return jsonResponse({
+    ok: true,
+    source: "kv",
+    limit,
+    hasMore,
+    nextCursor: hasMore ? (result?.cursor || null) : null,
+    listComplete: !!result?.list_complete,
+    items,
+  });
 }
 
 async function findRecordByRoute(env, route) {
@@ -662,10 +755,13 @@ async function findRecordByRoute(env, route) {
     }
   }
 
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
+  const kv = env?.VIDEY_KV;
+  if (!kv) return null;
+
+  const result = await kv.list({ prefix: VIDEO_PREFIX, limit: 1000 });
 
   for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
+    const raw = await kv.get(key.name);
     if (!raw) continue;
 
     try {
@@ -711,9 +807,12 @@ async function slugExists(env, slug) {
     if (row) return true;
   }
 
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
+  const kv = env?.VIDEY_KV;
+  if (!kv) return false;
+
+  const result = await kv.list({ prefix: VIDEO_PREFIX, limit: 1000 });
   for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
+    const raw = await kv.get(key.name);
     if (!raw) continue;
     try {
       const record = JSON.parse(raw);
@@ -976,7 +1075,7 @@ function renderHome(url) {
   <h1>MyBlobVidey</h1>
   <div class="box">
     <p>Polos, minimalis, dan tetap lincah.</p>
-    <p><a href="/api/upload">Buka uploader</a> | <a href="/api/list">Lihat JSON list</a></p>
+    <p><a href="/api/upload">Buka uploader</a> | <a href="/api/list">Lihat list D1</a> | <a href="/api/list/legacy">Lihat list KV legacy</a></p>
   </div>
 
   <div class="box">
