@@ -4,6 +4,7 @@ const VIDEO_PREFIX = "video:";
 const CDN_BASE = "https://cdn.videy.co";
 const DEFAULT_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c";
 const DEFAULT_UPLOAD_URL = "https://videy.co/api/upload";
+const DEFAULT_UPLOAD_FIELD = "file";
 const MAX_DEBUG_TEXT = 4000;
 
 const D1_VIDEOS_TABLE = "videy_videos";
@@ -64,27 +65,42 @@ async function ensureD1Schema(env) {
   if (!globalThis.__videyD1InitPromise) {
     globalThis.__videyD1InitPromise = (async () => {
       await db.exec(`
-CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
-  order_num INTEGER PRIMARY KEY,
-  slug TEXT NOT NULL UNIQUE,
-  title TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  videy_id TEXT,
-  source_url TEXT,
-  created_at TEXT NOT NULL)`);
+        CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
+          order_num INTEGER PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          videy_id TEXT,
+          source_url TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
 
-await db.exec(`
-CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
-  name TEXT PRIMARY KEY,
-  value INTEGER NOT NULL)`);
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
+          name TEXT PRIMARY KEY,
+          value INTEGER NOT NULL
+        );
+      `);
 
-await db.exec(`
-CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug
-ON ${D1_VIDEOS_TABLE}(slug)`);
+      await db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug
+        ON ${D1_VIDEOS_TABLE}(slug);
+      `);
 
-await db.exec(`
-CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at
-ON ${D1_VIDEOS_TABLE}(created_at)`);
+      await db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at
+        ON ${D1_VIDEOS_TABLE}(created_at);
+      `);
+
+      try {
+        await db
+          .prepare(`INSERT OR IGNORE INTO ${D1_COUNTERS_TABLE} (name, value) VALUES (?, ?)`)
+          .bind(D1_COUNTER_NAME, 0)
+          .run();
+      } catch {
+        // biarkan, schema lain tetap lanjut
+      }
     })();
   }
 
@@ -311,7 +327,7 @@ async function handleUpload(request, env, url) {
     return respondUploadError("File video wajib dipilih.", { mode }, 400, request);
   }
 
-  const upload = await uploadToVidey(file, visitorId);
+  const upload = await uploadToVidey(file, visitorId, env);
 
   if (!upload.ok) {
     return respondUploadError(
@@ -449,8 +465,14 @@ async function saveRecord(env, draft) {
   throw new Error("Gagal menyimpan metadata ke D1.");
 }
 
-async function uploadToVidey(file, visitorId) {
-  const uploadUrl = DEFAULT_UPLOAD_URL;
+async function uploadToVidey(file, visitorId, env) {
+  const uploadUrlInput = env?.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
+  const uploadField = env?.VIDEY_UPLOAD_FIELD || DEFAULT_UPLOAD_FIELD;
+
+  const uploadTarget = new URL(uploadUrlInput);
+  if (!uploadTarget.searchParams.has("visitorId")) {
+    uploadTarget.searchParams.set("visitorId", visitorId);
+  }
 
   const headers = {
     "User-Agent": "Mozilla/5.0",
@@ -458,9 +480,9 @@ async function uploadToVidey(file, visitorId) {
   };
 
   const formData = new FormData();
-  formData.append("file", file, file.name || "video.mp4");
+  formData.append(uploadField, file, file.name || "video.mp4");
 
-  const resp = await fetch(`${uploadUrl}?visitorId=${encodeURIComponent(visitorId)}`, {
+  const resp = await fetch(uploadTarget.toString(), {
     method: "POST",
     headers,
     body: formData,
