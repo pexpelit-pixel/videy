@@ -64,24 +64,27 @@ async function ensureD1Schema(env) {
   if (!globalThis.__videyD1InitPromise) {
     globalThis.__videyD1InitPromise = (async () => {
       await db.exec(`
-        CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
-          order_num INTEGER NOT NULL PRIMARY KEY,
-          slug TEXT NOT NULL UNIQUE,
-          title TEXT NOT NULL,
-          mode TEXT NOT NULL,
-          videy_id TEXT,
-          source_url TEXT,
-          created_at TEXT NOT NULL
-        );
+CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
+  order_num INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  videy_id TEXT,
+  source_url TEXT,
+  created_at TEXT NOT NULL)`);
 
-        CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
-          name TEXT PRIMARY KEY,
-          value INTEGER NOT NULL
-        );
+await db.exec(`
+CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
+  name TEXT PRIMARY KEY,
+  value INTEGER NOT NULL)`);
 
-        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug ON ${D1_VIDEOS_TABLE}(slug);
-        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at ON ${D1_VIDEOS_TABLE}(created_at);
-      `);
+await db.exec(`
+CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug
+ON ${D1_VIDEOS_TABLE}(slug)`);
+
+await db.exec(`
+CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at
+ON ${D1_VIDEOS_TABLE}(created_at)`);
     })();
   }
 
