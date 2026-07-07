@@ -565,7 +565,7 @@ async function handleList(env) {
     const result = await db
       .prepare(
         `SELECT
-          order_num AS order,
+          order_num AS order_num,
           slug,
           title,
           mode,
@@ -622,7 +622,7 @@ async function findRecordByRoute(env, route) {
       const row = await db
         .prepare(
           `SELECT
-            order_num AS order,
+            order_num AS order_num,
             slug,
             title,
             mode,
@@ -643,7 +643,7 @@ async function findRecordByRoute(env, route) {
       const row = await db
         .prepare(
           `SELECT
-            order_num AS order,
+            order_num AS order_num,
             slug,
             title,
             mode,
