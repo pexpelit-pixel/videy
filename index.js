@@ -64,42 +64,13 @@ async function ensureD1Schema(env) {
 
   if (!globalThis.__videyD1InitPromise) {
     globalThis.__videyD1InitPromise = (async () => {
-      await db.exec(`
-        CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
-          order_num INTEGER PRIMARY KEY,
-          slug TEXT NOT NULL UNIQUE,
-          title TEXT NOT NULL,
-          mode TEXT NOT NULL,
-          videy_id TEXT,
-          source_url TEXT,
-          created_at TEXT NOT NULL
-        );
-      `);
-
-      await db.exec(`
-        CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
-          name TEXT PRIMARY KEY,
-          value INTEGER NOT NULL
-        );
-      `);
-
-      await db.exec(`
-        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug
-        ON ${D1_VIDEOS_TABLE}(slug);
-      `);
-
-      await db.exec(`
-        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at
-        ON ${D1_VIDEOS_TABLE}(created_at);
-      `);
-
       try {
         await db
           .prepare(`INSERT OR IGNORE INTO ${D1_COUNTERS_TABLE} (name, value) VALUES (?, ?)`)
           .bind(D1_COUNTER_NAME, 0)
           .run();
       } catch {
-        // biarkan, schema lain tetap lanjut
+        // kalau counter row belum bisa dibuat, biarkan fungsi lain yang menangani
       }
     })();
   }
