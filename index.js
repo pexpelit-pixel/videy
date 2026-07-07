@@ -6,6 +6,10 @@ const DEFAULT_VISITOR_ID = "1f5f718b-06b2-40f9-82da-0a73dfdadd1c";
 const DEFAULT_UPLOAD_URL = "https://videy.co/api/upload";
 const MAX_DEBUG_TEXT = 4000;
 
+const D1_VIDEOS_TABLE = "videy_videos";
+const D1_COUNTERS_TABLE = "videy_counters";
+const D1_COUNTER_NAME = "video_order";
+
 export default {
   async fetch(request, env) {
     try {
@@ -49,6 +53,182 @@ export default {
   },
 };
 
+function getD1(env) {
+  return env?.DB || env?.D1 || env?.VIDEY_DB || null;
+}
+
+async function ensureD1Schema(env) {
+  const db = getD1(env);
+  if (!db) return false;
+
+  if (!globalThis.__videyD1InitPromise) {
+    globalThis.__videyD1InitPromise = (async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
+          order_num INTEGER NOT NULL PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          videy_id TEXT,
+          source_url TEXT,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
+          name TEXT PRIMARY KEY,
+          value INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_slug ON ${D1_VIDEOS_TABLE}(slug);
+        CREATE INDEX IF NOT EXISTS idx_${D1_VIDEOS_TABLE}_created_at ON ${D1_VIDEOS_TABLE}(created_at);
+      `);
+    })();
+  }
+
+  await globalThis.__videyD1InitPromise;
+  return true;
+}
+
+function isUniqueConstraintError(err) {
+  const msg = String(err?.message || err || "");
+  return /UNIQUE constraint failed|constraint failed|PRIMARY KEY constraint failed/i.test(msg);
+}
+
+function normalizeRecord(record) {
+  if (!record || typeof record !== "object") return record;
+
+  const order = Number(record.order ?? record.order_num ?? record.orderNum ?? 0) || null;
+
+  return {
+    title: record.title ?? "",
+    slug: record.slug ?? "",
+    order,
+    mode: record.mode ?? "",
+    createdAt: record.createdAt ?? record.created_at ?? "",
+    videyId: record.videyId ?? record.videy_id ?? null,
+    sourceUrl: record.sourceUrl ?? record.source_url ?? null,
+  };
+}
+
+async function getMaxOrderFromKv(env) {
+  if (!env?.VIDEY_KV) return 0;
+
+  const out = [];
+  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
+
+  for (const key of result.keys) {
+    const raw = await env.VIDEY_KV.get(key.name);
+    if (!raw) continue;
+
+    try {
+      const record = JSON.parse(raw);
+      const ord = Number(record.order || 0);
+      if (ord > 0) out.push(ord);
+    } catch {
+      continue;
+    }
+  }
+
+  return out.length ? Math.max(...out) : 0;
+}
+
+async function seedOrderCounter(env) {
+  const db = getD1(env);
+  if (!db) return 0;
+
+  await ensureD1Schema(env);
+
+  const currentCounterRow = await db
+    .prepare(`SELECT value FROM ${D1_COUNTERS_TABLE} WHERE name = ? LIMIT 1`)
+    .bind(D1_COUNTER_NAME)
+    .first();
+
+  const d1MaxRow = await db
+    .prepare(`SELECT COALESCE(MAX(order_num), 0) AS maxOrder FROM ${D1_VIDEOS_TABLE}`)
+    .first();
+
+  const kvMax = await getMaxOrderFromKv(env);
+  const currentCounter = Number(currentCounterRow?.value || 0);
+  const d1Max = Number(d1MaxRow?.maxOrder || 0);
+  const target = Math.max(currentCounter, d1Max, kvMax);
+
+  if (currentCounterRow) {
+    if (currentCounter < target) {
+      await db
+        .prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = ? WHERE name = ?`)
+        .bind(target, D1_COUNTER_NAME)
+        .run();
+    }
+    return target;
+  }
+
+  try {
+    await db
+      .prepare(`INSERT INTO ${D1_COUNTERS_TABLE} (name, value) VALUES (?, ?)`)
+      .bind(D1_COUNTER_NAME, target)
+      .run();
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
+  }
+
+  return target;
+}
+
+async function reserveOrder(env) {
+  const db = getD1(env);
+  if (!db) return await allocateOrderFromKV(env);
+
+  await seedOrderCounter(env);
+
+  let row = await db
+    .prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = value + 1 WHERE name = ? RETURNING value`)
+    .bind(D1_COUNTER_NAME)
+    .first();
+
+  let order = Number(row?.value || 0);
+
+  if (!order) {
+    await seedOrderCounter(env);
+    row = await db
+      .prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = value + 1 WHERE name = ? RETURNING value`)
+      .bind(D1_COUNTER_NAME)
+      .first();
+
+    order = Number(row?.value || 0);
+  }
+
+  if (order) return order;
+
+  return await allocateOrderFromKV(env);
+}
+
+async function allocateOrderFromKV(env) {
+  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
+  let maxOrder = 0;
+
+  for (const key of result.keys) {
+    const raw = await env.VIDEY_KV.get(key.name);
+    if (!raw) continue;
+    try {
+      const record = JSON.parse(raw);
+      const ord = Number(record.order || 0);
+      if (ord > maxOrder) maxOrder = ord;
+    } catch {
+      continue;
+    }
+  }
+
+  return maxOrder + 1;
+}
+
+async function allocateOrder(env) {
+  const db = getD1(env);
+  if (db) {
+    return await reserveOrder(env);
+  }
+  return await allocateOrderFromKV(env);
+}
+
 async function handleUpload(request, env, url) {
   const form = await request.formData();
 
@@ -60,56 +240,72 @@ async function handleUpload(request, env, url) {
 
   const visitorId = visitorIdInput || DEFAULT_VISITOR_ID;
   const mode = modeInput === "proxy" || sourceUrl ? "proxy" : "videy";
+  const createdAt = new Date().toISOString();
 
   if (!title) {
-    return respondUploadError("Judul wajib diisi.", {
-      mode,
-    }, 400, request);
+    return respondUploadError("Judul wajib diisi.", { mode }, 400, request);
   }
 
   if (mode === "proxy") {
     if (!isValidHttpUrl(sourceUrl)) {
-      return respondUploadError("URL sumber proxy tidak valid.", {
-        mode,
-      }, 400, request);
+      return respondUploadError("URL sumber proxy tidak valid.", { mode }, 400, request);
     }
 
-    const slug = await uniqueSlug(env, slugify(title));
-    const order = await allocateOrder(env);
-    const key = makeVideoKey(order, slug);
+    const baseSlug = slugify(title);
+    const slugCandidate = await uniqueSlug(env, baseSlug);
 
-    const record = {
+    const saved = await saveRecord(env, {
       title,
-      slug,
-      order,
+      slug: slugCandidate,
       mode: "proxy",
       sourceUrl,
-      createdAt: new Date().toISOString(),
+      createdAt,
+    });
+
+    const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+    const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    const key = makeVideoKey(saved.order, saved.slug);
+    const payload = {
+      title: saved.title,
+      slug: saved.slug,
+      order: saved.order,
+      mode: saved.mode,
+      createdAt: saved.createdAt,
+      sourceUrl: saved.sourceUrl,
     };
 
-    await env.VIDEY_KV.put(key, JSON.stringify(record));
-
-    const publicUrl = `${url.origin}/${order}/${slug}.mp4`;
-    const apiUrl = `${url.origin}/api/video/${order}/${slug}`;
+    let kvMirrored = false;
+    let kvError = "";
+    try {
+      await env.VIDEY_KV.put(key, JSON.stringify(payload));
+      kvMirrored = true;
+    } catch (err) {
+      kvError = err?.message || String(err);
+    }
 
     return respondUploadSuccess(
       {
         publicUrl,
         apiUrl,
-        order,
-        slug,
+        order: saved.order,
+        slug: saved.slug,
         mode,
         title,
-        message: "Proxy link tersimpan di KV.",
+        message: kvMirrored
+          ? (saved.storedInD1 ? "Proxy link tersimpan di D1 dan KV." : "Proxy link tersimpan di KV.")
+          : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError}`,
+        storage: {
+          d1: !!saved.storedInD1,
+          kv: kvMirrored,
+        },
       },
       request
     );
   }
 
   if (!(file instanceof File) || file.size <= 0) {
-    return respondUploadError("File video wajib dipilih.", {
-      mode,
-    }, 400, request);
+    return respondUploadError("File video wajib dipilih.", { mode }, 400, request);
   }
 
   const upload = await uploadToVidey(file, visitorId);
@@ -130,37 +326,124 @@ async function handleUpload(request, env, url) {
     );
   }
 
-  const slug = await uniqueSlug(env, slugify(title));
-  const order = await allocateOrder(env);
-  const key = makeVideoKey(order, slug);
+  const baseSlug = slugify(title);
+  const slugCandidate = await uniqueSlug(env, baseSlug);
 
-  const record = {
+  const saved = await saveRecord(env, {
     title,
-    slug,
-    order,
+    slug: slugCandidate,
     mode: "videy",
     videyId: upload.videyId,
-    createdAt: new Date().toISOString(),
+    createdAt,
+  });
+
+  const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+  const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+  const key = makeVideoKey(saved.order, saved.slug);
+  const payload = {
+    title: saved.title,
+    slug: saved.slug,
+    order: saved.order,
+    mode: saved.mode,
+    createdAt: saved.createdAt,
+    videyId: saved.videyId,
   };
 
-  await env.VIDEY_KV.put(key, JSON.stringify(record));
-
-  const publicUrl = `${url.origin}/${order}/${slug}.mp4`;
-  const apiUrl = `${url.origin}/api/video/${order}/${slug}`;
+  let kvMirrored = false;
+  let kvError = "";
+  try {
+    await env.VIDEY_KV.put(key, JSON.stringify(payload));
+    kvMirrored = true;
+  } catch (err) {
+    kvError = err?.message || String(err);
+  }
 
   return respondUploadSuccess(
     {
       publicUrl,
       apiUrl,
-      order,
-      slug,
+      order: saved.order,
+      slug: saved.slug,
       mode,
       title,
       videyId: upload.videyId,
-      message: "ID asli Videy berhasil disimpan ke KV.",
+      message: kvMirrored
+        ? (saved.storedInD1 ? "ID asli Videy berhasil disimpan ke D1 dan KV." : "ID asli Videy berhasil disimpan ke KV.")
+        : `ID asli Videy berhasil disimpan ke D1, mirror KV gagal: ${kvError}`,
+      storage: {
+        d1: !!saved.storedInD1,
+        kv: kvMirrored,
+      },
     },
     request
   );
+}
+
+async function saveRecord(env, draft) {
+  const db = getD1(env);
+
+  if (!db) {
+    const slug = await uniqueSlug(env, draft.slug);
+    const order = await allocateOrderFromKV(env);
+    return {
+      ...draft,
+      slug,
+      order,
+      storedInD1: false,
+    };
+  }
+
+  await ensureD1Schema(env);
+  await seedOrderCounter(env);
+
+  let order = await reserveOrder(env);
+  let slug = draft.slug;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      await db
+        .prepare(
+          `INSERT INTO ${D1_VIDEOS_TABLE}
+           (order_num, slug, title, mode, videy_id, source_url, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          order,
+          slug,
+          draft.title,
+          draft.mode,
+          draft.videyId ?? null,
+          draft.sourceUrl ?? null,
+          draft.createdAt
+        )
+        .run();
+
+      return {
+        ...draft,
+        slug,
+        order,
+        storedInD1: true,
+      };
+    } catch (err) {
+      if (!isUniqueConstraintError(err)) throw err;
+
+      const msg = String(err?.message || "");
+      if (/slug/i.test(msg)) {
+        slug = `${draft.slug}-${attempt + 1}`;
+        continue;
+      }
+
+      if (/order_num|PRIMARY KEY/i.test(msg)) {
+        order = await reserveOrder(env);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  throw new Error("Gagal menyimpan metadata ke D1.");
 }
 
 async function uploadToVidey(file, visitorId) {
@@ -278,6 +561,35 @@ async function handleApiVideo(env, order, slug) {
 
 async function handleList(env) {
   const out = [];
+  const seen = new Set();
+
+  const db = getD1(env);
+  if (db) {
+    await ensureD1Schema(env);
+    const result = await db
+      .prepare(
+        `SELECT
+          order_num AS order,
+          slug,
+          title,
+          mode,
+          videy_id AS videyId,
+          source_url AS sourceUrl,
+          created_at AS createdAt
+         FROM ${D1_VIDEOS_TABLE}`
+      )
+      .all();
+
+    const rows = result?.results || [];
+    for (const row of rows) {
+      const record = normalizeRecord(row);
+      const key = `${String(record.order ?? "")}:${String(record.slug ?? "")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(publicRecord(record));
+    }
+  }
+
   const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
 
   for (const key of result.keys) {
@@ -285,7 +597,11 @@ async function handleList(env) {
     if (!raw) continue;
     try {
       const record = JSON.parse(raw);
-      out.push(publicRecord(record));
+      const norm = normalizeRecord(record);
+      const dedupeKey = `${String(norm.order ?? "")}:${String(norm.slug ?? "")}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push(publicRecord(norm));
     } catch {
       continue;
     }
@@ -302,6 +618,54 @@ async function handleList(env) {
 }
 
 async function findRecordByRoute(env, route) {
+  const db = getD1(env);
+  if (db) {
+    await ensureD1Schema(env);
+
+    if (route.order && route.slug) {
+      const row = await db
+        .prepare(
+          `SELECT
+            order_num AS order,
+            slug,
+            title,
+            mode,
+            videy_id AS videyId,
+            source_url AS sourceUrl,
+            created_at AS createdAt
+           FROM ${D1_VIDEOS_TABLE}
+           WHERE order_num = ? AND slug = ?
+           LIMIT 1`
+        )
+        .bind(Number(route.order), route.slug)
+        .first();
+
+      if (row) return normalizeRecord(row);
+    }
+
+    if (route.slug) {
+      const row = await db
+        .prepare(
+          `SELECT
+            order_num AS order,
+            slug,
+            title,
+            mode,
+            videy_id AS videyId,
+            source_url AS sourceUrl,
+            created_at AS createdAt
+           FROM ${D1_VIDEOS_TABLE}
+           WHERE slug = ?
+           ORDER BY order_num DESC
+           LIMIT 1`
+        )
+        .bind(route.slug)
+        .first();
+
+      if (row) return normalizeRecord(row);
+    }
+  }
+
   const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
 
   for (const key of result.keys) {
@@ -313,10 +677,10 @@ async function findRecordByRoute(env, route) {
 
       if (route.order && route.slug) {
         if (String(record.order) === String(route.order) && record.slug === route.slug) {
-          return record;
+          return normalizeRecord(record);
         }
       } else if (route.slug) {
-        if (record.slug === route.slug) return record;
+        if (record.slug === route.slug) return normalizeRecord(record);
       }
     } catch {
       continue;
@@ -340,6 +704,17 @@ async function uniqueSlug(env, base) {
 }
 
 async function slugExists(env, slug) {
+  const db = getD1(env);
+  if (db) {
+    await ensureD1Schema(env);
+    const row = await db
+      .prepare(`SELECT 1 AS found FROM ${D1_VIDEOS_TABLE} WHERE slug = ? LIMIT 1`)
+      .bind(slug)
+      .first();
+
+    if (row) return true;
+  }
+
   const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
   for (const key of result.keys) {
     const raw = await env.VIDEY_KV.get(key.name);
@@ -351,26 +726,8 @@ async function slugExists(env, slug) {
       continue;
     }
   }
+
   return false;
-}
-
-async function allocateOrder(env) {
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
-  let maxOrder = 0;
-
-  for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
-    if (!raw) continue;
-    try {
-      const record = JSON.parse(raw);
-      const ord = Number(record.order || 0);
-      if (ord > maxOrder) maxOrder = ord;
-    } catch {
-      continue;
-    }
-  }
-
-  return maxOrder + 1;
 }
 
 function makeVideoKey(order, slug) {
@@ -445,18 +802,19 @@ function clean(v) {
 }
 
 function publicRecord(record) {
-  if (!record || typeof record !== "object") return record;
+  const n = normalizeRecord(record);
+  if (!n || typeof n !== "object") return record;
 
   const out = {
-    title: record.title,
-    slug: record.slug,
-    order: record.order,
-    mode: record.mode,
-    createdAt: record.createdAt,
+    title: n.title,
+    slug: n.slug,
+    order: n.order,
+    mode: n.mode,
+    createdAt: n.createdAt,
   };
 
-  if (record.mode === "videy" && record.videyId) {
-    out.videyId = record.videyId;
+  if (n.mode === "videy" && n.videyId) {
+    out.videyId = n.videyId;
   }
 
   return out;
