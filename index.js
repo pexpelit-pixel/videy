@@ -50,6 +50,10 @@ export default {
         return await handleLegacyList(env, url);
       }
 
+      if (pathname === "/list") {
+        return await renderListView(env, url);
+      }
+
       if (pathname.startsWith("/api/video/")) {
         const { order, slug } = parseApiVideoPath(pathname);
         return await handleApiVideo(env, order, slug);
@@ -241,6 +245,7 @@ async function reserveOrder(env) {
 }
 
 async function allocateOrderFromKV(env) {
+  if (!env?.VIDEY_KV) return 1;
   const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
   let maxOrder = 0;
 
@@ -277,7 +282,13 @@ async function handleUpload(request, env, url) {
   const file = form.get("file");
 
   const visitorId = visitorIdInput || DEFAULT_VISITOR_ID;
-  const mode = modeInput === "proxy" || sourceUrl ? "proxy" : "videy";
+  
+  let mode = modeInput || (sourceUrl ? "proxy" : "videy");
+  if (!["videy", "proxy", "b2"].includes(mode)) {
+    mode = sourceUrl ? "proxy" : "videy";
+  }
+  if (mode === "proxy" && !sourceUrl) mode = "videy";
+  
   const createdAt = new Date().toISOString();
 
   if (!title) {
@@ -337,6 +348,78 @@ async function handleUpload(request, env, url) {
           : saved.storedInD1
             ? "Proxy link tersimpan di D1."
             : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`,
+        storage: {
+          d1: !!saved.storedInD1,
+          kv: kvMirrored,
+        },
+      },
+      request
+    );
+  }
+
+  if (mode === "b2") {
+    if (!(file instanceof File) || file.size <= 0) {
+      return respondUploadError("File video wajib dipilih untuk mode B2.", { mode }, 400, request);
+    }
+
+    const baseSlug = slugify(title);
+    const upload = await uploadToB2(file, baseSlug, env);
+
+    if (!upload.ok) {
+      return respondUploadError(
+        `Upload B2 gagal: ${upload.error}`,
+        { mode, raw: upload.raw },
+        502,
+        request
+      );
+    }
+
+    const slugCandidate = await uniqueSlug(env, baseSlug);
+    const saved = await saveRecord(env, {
+      title,
+      slug: slugCandidate,
+      mode: "b2",
+      sourceUrl: upload.publicUrl,
+      createdAt,
+    });
+
+    const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+    const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    const key = makeVideoKey(saved.order, saved.slug);
+    const payload = {
+      title: saved.title,
+      slug: saved.slug,
+      order: saved.order,
+      mode: saved.mode,
+      createdAt: saved.createdAt,
+      sourceUrl: saved.sourceUrl,
+    };
+
+    let kvMirrored = false;
+    let kvError = "";
+    if (shouldMirrorKv(env) && env?.VIDEY_KV) {
+      try {
+        await env.VIDEY_KV.put(key, JSON.stringify(payload));
+        kvMirrored = true;
+      } catch (err) {
+        kvError = err?.message || String(err);
+      }
+    }
+
+    return respondUploadSuccess(
+      {
+        publicUrl,
+        apiUrl,
+        order: saved.order,
+        slug: saved.slug,
+        mode,
+        title,
+        message: kvMirrored
+          ? (saved.storedInD1 ? "File B2 berhasil disimpan ke D1 dan KV." : "File B2 berhasil disimpan ke KV.")
+          : saved.storedInD1
+            ? "File B2 berhasil disimpan ke D1."
+            : `File B2 berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`,
         storage: {
           d1: !!saved.storedInD1,
           kv: kvMirrored,
@@ -451,8 +534,8 @@ async function saveRecord(env, draft) {
       await db
         .prepare(
           `INSERT INTO ${D1_VIDEOS_TABLE}
-           (order_num, slug, title, mode, videy_id, source_url, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          (order_num, slug, title, mode, videy_id, source_url, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
           order,
@@ -490,6 +573,76 @@ async function saveRecord(env, draft) {
   }
 
   throw new Error("Gagal menyimpan metadata ke D1.");
+}
+
+async function uploadToB2(file, slugBase, env) {
+  const keyId = env?.B2_KEY_ID;
+  const appKey = env?.B2_APP_KEY;
+  const bucketName = env?.B2_BUCKET_NAME || "videy-bucket";
+  const b2PublicUrl = env?.B2_PUBLIC_URL;
+
+  if (!keyId || !appKey) {
+    return { ok: false, error: "B2 credentials (B2_KEY_ID / B2_APP_KEY) belum disetting di Environment Variables" };
+  }
+
+  try {
+    const authResp = await fetch("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", {
+      headers: { "Authorization": "Basic " + btoa(`${keyId}:${appKey}`) }
+    });
+    if (!authResp.ok) return { ok: false, error: "B2 auth failed", raw: await authResp.text() };
+    const authData = await authResp.json();
+
+    let bucketId = env?.B2_BUCKET_ID;
+    if (!bucketId) {
+      const listResp = await fetch(`${authData.apiUrl}/b2api/v2/b2_list_buckets`, {
+        method: "POST",
+        headers: { "Authorization": authData.authorizationToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId: authData.accountId, bucketName })
+      });
+      if (!listResp.ok) return { ok: false, error: "B2 list buckets failed", raw: await listResp.text() };
+      const listData = await listResp.json();
+      const bucket = listData.buckets.find(b => b.bucketName === bucketName);
+      if (!bucket) return { ok: false, error: `B2 bucket '${bucketName}' tidak ditemukan` };
+      bucketId = bucket.bucketId;
+    }
+
+    const getUrlResp = await fetch(`${authData.apiUrl}/b2api/v2/b2_get_upload_url`, {
+      method: "POST",
+      headers: { "Authorization": authData.authorizationToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ bucketId })
+    });
+    if (!getUrlResp.ok) return { ok: false, error: "B2 get upload url failed", raw: await getUrlResp.text() };
+    const uploadData = await getUrlResp.json();
+
+    const fileName = `${Date.now()}-${slugBase}.mp4`;
+    const arrayBuffer = await file.arrayBuffer();
+    
+    const uploadResp = await fetch(uploadData.uploadUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": uploadData.authorizationToken,
+        "X-Bz-File-Name": encodeURIComponent(fileName),
+        "Content-Type": file.type || "video/mp4",
+        "X-Bz-Content-Sha1": "do_not_verify"
+      },
+      body: arrayBuffer
+    });
+
+    if (!uploadResp.ok) return { ok: false, error: "B2 upload gagal", raw: await uploadResp.text() };
+    const uploadResult = await uploadResp.json();
+
+    const downloadUrl = b2PublicUrl || `${authData.downloadUrl}/file/${bucketName}`;
+    const publicUrl = `${downloadUrl}/${encodeURIComponent(fileName)}`;
+
+    return {
+      ok: true,
+      b2FileId: uploadResult.fileId,
+      publicUrl,
+      fileName
+    };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 }
 
 async function uploadToVidey(file, visitorId, env) {
@@ -558,7 +711,7 @@ async function serveVideoByRoute(route, request, env) {
   const record = await findRecordByRoute(env, route);
   if (!record) return textResponse("Video tidak ditemukan", 404);
 
-  if (record.mode === "proxy") {
+  if (record.mode === "proxy" || record.mode === "b2") {
     return await proxyToUpstream(record.sourceUrl, request, record);
   }
 
@@ -649,8 +802,90 @@ async function handleList(env, url) {
     limit,
     hasMore,
     nextPage: hasMore ? page + 1 : null,
+    nextPageUrl: hasMore ? `${url.origin}/api/list?page=${page + 1}&limit=${limit}` : null,
     items,
   });
+}
+
+async function renderListView(env, url) {
+  const db = getD1(env);
+  if (!db) return htmlResponse("<h1>D1 Database tidak tersedia</h1>", 503);
+
+  await ensureD1Schema(env);
+  const { page, limit, offset } = parsePagination(url, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+
+  const result = await db
+    .prepare(
+      `SELECT
+        order_num AS order_num,
+        slug,
+        title,
+        mode,
+        videy_id AS videyId,
+        source_url AS sourceUrl,
+        created_at AS createdAt
+       FROM ${D1_VIDEOS_TABLE}
+       ORDER BY order_num ASC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(limit + 1, offset)
+    .all();
+
+  const rows = result?.results || [];
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  
+  const nextPageUrl = hasMore ? `${url.origin}/list?page=${page + 1}&limit=${limit}` : null;
+  const prevPageUrl = page > 1 ? `${url.origin}/list?page=${page - 1}&limit=${limit}` : null;
+
+  let html = `<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daftar Video</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:920px;margin:40px auto;padding:0 16px;line-height:1.5}
+    table{width:100%;border-collapse:collapse;margin-top:16px}
+    th,td{border:1px solid #ddd;padding:8px;text-align:left}
+    th{background:#f4f4f5}
+    .pagination{margin-top:20px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+    .btn{padding:10px 16px;background:#111;color:#fff;text-decoration:none;border-radius:8px}
+    .btn.disabled{background:#ccc;pointer-events:none;cursor:not-allowed}
+  </style>
+</head>
+<body>
+  <h1>Daftar Video</h1>
+  <p><a href="/api/upload">Upload video baru</a> | <a href="/">Beranda</a></p>
+  <table>
+    <thead>
+      <tr><th>Order</th><th>Slug</th><th>Title</th><th>Mode</th><th>Stream URL</th></tr>
+    </thead>
+    <tbody>`;
+
+  for (const item of items) {
+    const pubUrl = `${url.origin}/${item.order_num}/${item.slug}.mp4`;
+    html += `
+      <tr>
+        <td>${escapeHtml(item.order_num)}</td>
+        <td>${escapeHtml(item.slug)}</td>
+        <td>${escapeHtml(item.title)}</td>
+        <td>${escapeHtml(item.mode)}</td>
+        <td><a href="${escapeHtml(pubUrl)}" target="_blank">Buka</a></td>
+      </tr>`;
+  }
+
+  html += `
+    </tbody>
+  </table>
+  <div class="pagination">
+    <a href="${prevPageUrl || '#'}" class="btn ${!prevPageUrl ? 'disabled' : ''}">← Halaman Sebelumnya</a>
+    <a href="${nextPageUrl || '#'}" class="btn ${!hasMore ? 'disabled' : ''}">Halaman Berikutnya →</a>
+  </div>
+</body>
+</html>`;
+
+  return htmlResponse(html);
 }
 
 async function handleLegacyList(env, url) {
@@ -1075,9 +1310,8 @@ function renderHome(url) {
   <h1>MyBlobVidey</h1>
   <div class="box">
     <p>Polos, minimalis, dan tetap lincah.</p>
-    <p><a href="/api/upload">Buka uploader</a> | <a href="/api/list">Lihat list D1</a> | <a href="/api/list/legacy">Lihat list KV legacy</a></p>
+    <p><a href="/api/upload">Buka uploader</a> | <a href="/list">Lihat Daftar Video (UI)</a> | <a href="/api/list">Lihat list D1 (JSON)</a> | <a href="/api/list/legacy">Lihat list KV legacy</a></p>
   </div>
-
   <div class="box">
     <strong>Format URL publik</strong>
     <ul>
@@ -1147,15 +1381,15 @@ function renderUploadPage() {
 </head>
 <body>
   <h1>Uploader</h1>
-
   <div class="box">
     <form id="uploadForm" method="POST" enctype="multipart/form-data">
       <label>Judul</label>
       <input name="title" required placeholder="contoh: kucing-lucu">
-
+      
       <div class="radioRow" aria-label="Mode upload">
-        <label><input type="radio" name="mode" value="video" checked> Upload video</label>
-        <label><input type="radio" name="mode" value="proxy"> Upload link</label>
+        <label><input type="radio" name="mode" value="video" checked> Upload video (Videy)</label>
+        <label><input type="radio" name="mode" value="b2"> Upload video (B2)</label>
+        <label><input type="radio" name="mode" value="proxy"> Upload link (Proxy)</label>
       </div>
 
       <div id="videoFields">
@@ -1165,16 +1399,16 @@ function renderUploadPage() {
 
       <div id="proxyFields" class="hidden">
         <label>Link video sumber</label>
-        <input name="sourceUrl" placeholder="https://Moonlight.co/jua.mp4">
+        <input name="sourceUrl" placeholder="https://example.com/video.mp4">
       </div>
 
-      <label>visitorId (opsional)</label>
+      <label>visitorId (opsional - khusus Videy)</label>
       <input name="visitorId" placeholder="1f5f718b-06b2-40f9-82da-0a73dfdadd1c">
 
       <button id="submitBtn" type="submit">Upload</button>
 
       <div class="hint">
-        Mode video akan upload ke Videy. Mode link akan disimpan sebagai proxy tanpa upload ke Videy.
+        Mode Videy akan upload ke Videy. Mode B2 akan upload ke Backblaze B2 (butuh env B2_KEY_ID, B2_APP_KEY, B2_BUCKET_NAME). Mode link akan disimpan sebagai proxy tanpa upload file.
       </div>
     </form>
 
@@ -1185,9 +1419,8 @@ function renderUploadPage() {
 
     <div id="resultWrap" class="block hidden"></div>
   </div>
-
   <p><small>Semua tetap polos, ringan, dan ramah mata.</small></p>
-
+  
   <script>
     const form = document.getElementById("uploadForm");
     const submitBtn = document.getElementById("submitBtn");
@@ -1340,7 +1573,7 @@ function renderUploadPage() {
       xhr.responseType = "text";
 
       xhr.upload.onprogress = function (ev) {
-        if (mode === "video") {
+        if (mode === "video" || mode === "b2") {
           progressBar.hidden = false;
           if (ev.lengthComputable) {
             progressBar.value = Math.round((ev.loaded / ev.total) * 100);
@@ -1441,7 +1674,6 @@ function renderResultBlock({ title, message, data = null, color = "black" }) {
       <div class="title" style="color:${color}">${escapeHtml(title)}</div>
       <div>${escapeHtml(message)}</div>
     </div>
-
     ${
       data
         ? `
@@ -1478,7 +1710,6 @@ function renderResultBlock({ title, message, data = null, color = "black" }) {
         : ""
     }
   </div>
-
   <script>
     document.querySelectorAll("[data-copy]").forEach((btn) => {
       btn.addEventListener("click", async () => {
