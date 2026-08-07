@@ -378,7 +378,7 @@ async function saveRecord(env, draft) {
 async function uploadToB2(file, slugBase, env) {
   const keyId = env?.B2_KEY_ID;
   const appKey = env?.B2_APP_KEY;
-  const bucketName = env?.B2_BUCKET_NAME || "videy-bucket";
+  const bucketName = env?.B2_BUCKET_NAME;
   if (!keyId || !appKey) return { ok: false, error: "B2 credentials (B2_KEY_ID / B2_APP_KEY) belum disetting" };
 
   try {
