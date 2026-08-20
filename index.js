@@ -1,4 +1,34 @@
 // index.js
+//
+// CHUNKED B2 UPLOAD
+// - Menjaga API upload lama tetap ada.
+// - Menambahkan:
+//
+//   POST /api/upload/chunk/init
+//   PUT  /api/upload/chunk/part?uploadId=...&partNumber=...
+//   POST /api/upload/chunk/complete
+//   GET  /api/upload/chunk/status?uploadId=...
+//
+// - Chunk dikirim langsung sebagai request body, bukan multipart FormData.
+// - Worker tidak memuat file 2.26 GB ke memory.
+// - Setiap chunk diteruskan langsung ke B2 Large File API.
+// - Default chunk 50 MiB, aman terhadap batas request Cloudflare 100 MB.
+// - B2 Large File memakai start -> upload_part -> finish.
+// - D1 menyimpan session + SHA1 setiap part.
+// - Ada token session agar upload tidak bisa dipalsukan hanya dengan uploadId.
+// - Debug diperketat melalui X-Upload-Debug dan /status.
+// - API /api/upload lama tetap dipertahankan untuk kompatibilitas.
+//
+// Cloudflare membatasi request body Free/Pro 100 MB dan Business 200 MB,
+// sehingga 50 MiB/chunk menjadi pilihan aman. 0
+//
+// B2 Large File menggunakan:
+// b2_start_large_file
+// b2_get_upload_part_url
+// b2_upload_part
+// b2_finish_large_file
+// dan setiap part wajib mempunyai SHA-1 + Content-Length. 1
+
 const UPLOAD_PATH = "/api/upload";
 const VIDEO_PREFIX = "video:";
 const CDN_BASE = "https://cdn.videy.co";
@@ -11,40 +41,173 @@ const D1_VIDEOS_TABLE = "videy_videos";
 const D1_COUNTERS_TABLE = "videy_counters";
 const D1_COUNTER_NAME = "video_order";
 
+const D1_UPLOAD_SESSIONS_TABLE = "b2_upload_sessions";
+const D1_UPLOAD_PARTS_TABLE = "b2_upload_parts";
+
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 200;
 const DEFAULT_LEGACY_LIMIT = 100;
 const MAX_LEGACY_LIMIT = 200;
 const DEFAULT_KV_MIRROR = false;
 
+// ============================================================
+// CHUNK CONFIG
+// ============================================================
+
+const DEFAULT_CHUNK_SIZE = 50 * 1024 * 1024; // 50 MiB
+const MIN_CHUNK_SIZE = 5 * 1024 * 1024;      // B2 minimum
+const MAX_CHUNK_SIZE = 90 * 1024 * 1024;     // safety margin under CF 100 MB
+
+const MAX_B2_PARTS = 10000;
+const MAX_UPLOAD_SIZE = 10 * 1024 * 1024 * 1024 * 1024; // 10 TiB
+
+const CHUNK_UPLOAD_EXPIRY_MS = 24 * 60 * 60 * 1000;
+const UPLOAD_TOKEN_BYTES = 24;
+
+const DEBUG_HEADER = "X-Upload-Debug";
+
 // Cache autentikasi & B2 Info agar tidak bolak-balik login
-let b2AuthCache = { token: null, apiUrl: null, downloadUrl: null, accountId: null, expires: 0 };
-let b2BucketCache = { id: null, name: null };
+let b2AuthCache = {
+  token: null,
+  apiUrl: null,
+  downloadUrl: null,
+  accountId: null,
+  recommendedPartSize: null,
+  expires: 0
+};
+
+let b2BucketCache = {
+  id: null,
+  name: null
+};
+
+// ============================================================
+// MAIN ROUTER
+// ============================================================
 
 export default {
   async fetch(request, env) {
+    const requestId = crypto.randomUUID();
+
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
 
+      // --------------------------------------------------------
+      // BASIC ROUTES
+      // --------------------------------------------------------
+
       if (pathname === "/") {
-        return htmlResponse(renderHome(url));
+        return htmlResponse(renderHome(url), 200, {
+          "X-Request-Id": requestId
+        });
       }
+
+      // --------------------------------------------------------
+      // LEGACY UPLOAD
+      // --------------------------------------------------------
 
       if (pathname === UPLOAD_PATH) {
         if (request.method === "GET") {
-          return htmlResponse(renderUploadPage());
+          return htmlResponse(renderUploadPage(), 200, {
+            "X-Request-Id": requestId
+          });
         }
+
         if (request.method === "POST") {
-          return await handleUpload(request, env, url);
+          return await handleUpload(request, env, url, requestId);
         }
-        return textResponse("Method Not Allowed", 405);
+
+        return textResponse("Method Not Allowed", 405, {
+          "X-Request-Id": requestId
+        });
       }
+
+      // --------------------------------------------------------
+      // CHUNKED B2 UPLOAD
+      // --------------------------------------------------------
+
+      if (pathname === "/api/upload/chunk/init") {
+        if (request.method !== "POST") {
+          return jsonResponse(
+            {
+              ok: false,
+              error: "method_not_allowed",
+              requestId
+            },
+            405,
+            {
+              "X-Request-Id": requestId
+            }
+          );
+        }
+
+        return await handleChunkInit(request, env, url, requestId);
+      }
+
+      if (pathname === "/api/upload/chunk/part") {
+        if (request.method !== "PUT" && request.method !== "POST") {
+          return jsonResponse(
+            {
+              ok: false,
+              error: "method_not_allowed",
+              requestId
+            },
+            405,
+            {
+              "X-Request-Id": requestId
+            }
+          );
+        }
+
+        return await handleChunkPart(request, env, requestId);
+      }
+
+      if (pathname === "/api/upload/chunk/complete") {
+        if (request.method !== "POST") {
+          return jsonResponse(
+            {
+              ok: false,
+              error: "method_not_allowed",
+              requestId
+            },
+            405,
+            {
+              "X-Request-Id": requestId
+            }
+          );
+        }
+
+        return await handleChunkComplete(request, env, url, requestId);
+      }
+
+      if (pathname === "/api/upload/chunk/status") {
+        if (request.method !== "GET") {
+          return jsonResponse(
+            {
+              ok: false,
+              error: "method_not_allowed",
+              requestId
+            },
+            405,
+            {
+              "X-Request-Id": requestId
+            }
+          );
+        }
+
+        return await handleChunkStatus(request, env, requestId);
+      }
+
+      // --------------------------------------------------------
+      // LIST
+      // --------------------------------------------------------
 
       if (pathname === "/api/list" || pathname === "/list") {
         if ((url.searchParams.get("source") || "").toLowerCase() === "kv") {
           return await handleLegacyList(env, url, request);
         }
+
         return await handleList(env, url, request);
       }
 
@@ -52,22 +215,45 @@ export default {
         return await handleLegacyList(env, url, request);
       }
 
+      // --------------------------------------------------------
+      // API VIDEO
+      // --------------------------------------------------------
+
       if (pathname.startsWith("/api/video/")) {
         const { order, slug } = parseApiVideoPath(pathname);
         return await handleApiVideo(env, order, slug);
       }
 
+      // --------------------------------------------------------
+      // PUBLIC VIDEO
+      // --------------------------------------------------------
+
       const route = parsePublicRoute(pathname);
+
       if (route) {
         return await serveVideoByRoute(route, request, env);
       }
 
-      return textResponse("Not Found", 404);
+      return textResponse("Not Found", 404, {
+        "X-Request-Id": requestId
+      });
     } catch (err) {
-      return textResponse(`Error: ${err?.message || String(err)}`, 500);
+      console.error("[FATAL]", err);
+
+      return textResponse(
+        `Error: ${err?.message || String(err)}`,
+        500,
+        {
+          "X-Request-Id": requestId
+        }
+      );
     }
   },
 };
+
+// ============================================================
+// D1
+// ============================================================
 
 function getD1(env) {
   return env?.DB || env?.D1 || env?.VIDEY_DB || null;
@@ -75,11 +261,16 @@ function getD1(env) {
 
 async function ensureD1Schema(env) {
   const db = getD1(env);
+
   if (!db) return false;
 
   if (!globalThis.__videyD1InitPromise) {
     globalThis.__videyD1InitPromise = (async () => {
       try {
+        // ------------------------------------------------------
+        // VIDEO TABLE
+        // ------------------------------------------------------
+
         await db.prepare(`
           CREATE TABLE IF NOT EXISTS ${D1_VIDEOS_TABLE} (
             order_num INTEGER PRIMARY KEY,
@@ -93,43 +284,335 @@ async function ensureD1Schema(env) {
           )
         `).run();
 
-        await db.prepare(`CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (name TEXT PRIMARY KEY, value INTEGER)`).run();
-        
+        // ------------------------------------------------------
+        // COUNTER TABLE
+        // ------------------------------------------------------
+
+        await db.prepare(`
+          CREATE TABLE IF NOT EXISTS ${D1_COUNTERS_TABLE} (
+            name TEXT PRIMARY KEY,
+            value INTEGER
+          )
+        `).run();
+
         await db
-          .prepare(`INSERT OR IGNORE INTO ${D1_COUNTERS_TABLE} (name, value) VALUES (?, ?)`)
+          .prepare(`
+            INSERT OR IGNORE INTO ${D1_COUNTERS_TABLE}
+            (name, value)
+            VALUES (?, ?)
+          `)
           .bind(D1_COUNTER_NAME, 0)
           .run();
-          
-        // Auto migrate schema jika b2_file_name belum ada
-        const tableInfo = await db.prepare(`PRAGMA table_info(${D1_VIDEOS_TABLE})`).all();
-        const columns = tableInfo.results.map(c => c.name);
-        if (!columns.includes("b2_file_name")) {
-          await db.prepare(`ALTER TABLE ${D1_VIDEOS_TABLE} ADD COLUMN b2_file_name TEXT`).run();
+
+        // ------------------------------------------------------
+        // AUTO MIGRATE VIDEO TABLE
+        // ------------------------------------------------------
+
+        try {
+          const tableInfo = await db
+            .prepare(`PRAGMA table_info(${D1_VIDEOS_TABLE})`)
+            .all();
+
+          const columns = (tableInfo.results || []).map(c => c.name);
+
+          if (!columns.includes("b2_file_name")) {
+            await db
+              .prepare(`
+                ALTER TABLE ${D1_VIDEOS_TABLE}
+                ADD COLUMN b2_file_name TEXT
+              `)
+              .run();
+          }
+        } catch (err) {
+          console.error("[D1 MIGRATE VIDEO]", err);
         }
+
+        // ------------------------------------------------------
+        // CHUNK SESSIONS
+        // ------------------------------------------------------
+
+        await db.prepare(`
+          CREATE TABLE IF NOT EXISTS ${D1_UPLOAD_SESSIONS_TABLE} (
+            upload_id TEXT PRIMARY KEY,
+            session_token TEXT NOT NULL,
+            title TEXT NOT NULL,
+            base_slug TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            chunk_size INTEGER NOT NULL,
+            total_parts INTEGER NOT NULL,
+            b2_file_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            result_order INTEGER,
+            result_slug TEXT,
+            b2_file_name TEXT
+          )
+        `).run();
+
+        // ------------------------------------------------------
+        // CHUNK PARTS
+        // ------------------------------------------------------
+
+        await db.prepare(`
+          CREATE TABLE IF NOT EXISTS ${D1_UPLOAD_PARTS_TABLE} (
+            upload_id TEXT NOT NULL,
+            part_number INTEGER NOT NULL,
+            sha1 TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            PRIMARY KEY (upload_id, part_number)
+          )
+        `).run();
+
+        // ------------------------------------------------------
+        // INDEXES
+        // ------------------------------------------------------
+
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_b2_upload_parts_upload_id
+          ON ${D1_UPLOAD_PARTS_TABLE}(upload_id)
+        `).run();
+
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_b2_upload_sessions_status
+          ON ${D1_UPLOAD_SESSIONS_TABLE}(status)
+        `).run();
+
+        console.log("[D1] Schema ready");
       } catch (err) {
-        // ignore init errors
+        console.error("[D1 INIT]", err);
       }
     })();
   }
 
   await globalThis.__videyD1InitPromise;
+
   return true;
 }
 
+// ============================================================
+// ORDER COUNTER
+// ============================================================
+
+async function getMaxOrderFromKv(env) {
+  if (!env?.VIDEY_KV) return 0;
+
+  const out = [];
+
+  const result = await env.VIDEY_KV.list({
+    prefix: VIDEO_PREFIX,
+    limit: 1000
+  });
+
+  for (const key of result.keys) {
+    const raw = await env.VIDEY_KV.get(key.name);
+
+    if (!raw) continue;
+
+    try {
+      const record = JSON.parse(raw);
+      const ord = Number(record.order || 0);
+
+      if (ord > 0) out.push(ord);
+    } catch {
+      continue;
+    }
+  }
+
+  return out.length ? Math.max(...out) : 0;
+}
+
+async function seedOrderCounter(env) {
+  const db = getD1(env);
+
+  if (!db) return 0;
+
+  await ensureD1Schema(env);
+
+  const currentCounterRow = await db
+    .prepare(`
+      SELECT value
+      FROM ${D1_COUNTERS_TABLE}
+      WHERE name = ?
+      LIMIT 1
+    `)
+    .bind(D1_COUNTER_NAME)
+    .first();
+
+  const d1MaxRow = await db
+    .prepare(`
+      SELECT COALESCE(MAX(order_num), 0) AS maxOrder
+      FROM ${D1_VIDEOS_TABLE}
+    `)
+    .first();
+
+  const kvMax = await getMaxOrderFromKv(env);
+
+  const currentCounter = Number(currentCounterRow?.value || 0);
+  const d1Max = Number(d1MaxRow?.maxOrder || 0);
+
+  const target = Math.max(
+    currentCounter,
+    d1Max,
+    kvMax
+  );
+
+  if (currentCounterRow) {
+    if (currentCounter < target) {
+      await db
+        .prepare(`
+          UPDATE ${D1_COUNTERS_TABLE}
+          SET value = ?
+          WHERE name = ?
+        `)
+        .bind(target, D1_COUNTER_NAME)
+        .run();
+    }
+
+    return target;
+  }
+
+  try {
+    await db
+      .prepare(`
+        INSERT INTO ${D1_COUNTERS_TABLE}
+        (name, value)
+        VALUES (?, ?)
+      `)
+      .bind(D1_COUNTER_NAME, target)
+      .run();
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
+  }
+
+  return target;
+}
+
+async function reserveOrder(env) {
+  const db = getD1(env);
+
+  if (!db) {
+    return await allocateOrderFromKV(env);
+  }
+
+  await seedOrderCounter(env);
+
+  let row = await db
+    .prepare(`
+      UPDATE ${D1_COUNTERS_TABLE}
+      SET value = value + 1
+      WHERE name = ?
+      RETURNING value
+    `)
+    .bind(D1_COUNTER_NAME)
+    .first();
+
+  let order = Number(row?.value || 0);
+
+  if (!order) {
+    await seedOrderCounter(env);
+
+    row = await db
+      .prepare(`
+        UPDATE ${D1_COUNTERS_TABLE}
+        SET value = value + 1
+        WHERE name = ?
+        RETURNING value
+      `)
+      .bind(D1_COUNTER_NAME)
+      .first();
+
+    order = Number(row?.value || 0);
+  }
+
+  if (order) return order;
+
+  return await allocateOrderFromKV(env);
+}
+
+async function allocateOrderFromKV(env) {
+  if (!env?.VIDEY_KV) return 1;
+
+  const result = await env.VIDEY_KV.list({
+    prefix: VIDEO_PREFIX,
+    limit: 1000
+  });
+
+  let maxOrder = 0;
+
+  for (const key of result.keys) {
+    const raw = await env.VIDEY_KV.get(key.name);
+
+    if (!raw) continue;
+
+    try {
+      const record = JSON.parse(raw);
+      const ord = Number(record.order || 0);
+
+      if (ord > maxOrder) maxOrder = ord;
+    } catch {
+      continue;
+    }
+  }
+
+  return maxOrder + 1;
+}
+
+async function allocateOrder(env) {
+  const db = getD1(env);
+
+  if (db) {
+    return await reserveOrder(env);
+  }
+
+  return await allocateOrderFromKV(env);
+}
+
+// ============================================================
+// B2 AUTH
+// ============================================================
+
 async function getB2Auth(env) {
   const now = Date.now();
-  if (b2AuthCache.token && b2AuthCache.expires > now + 60000) {
+
+  if (
+    b2AuthCache.token &&
+    b2AuthCache.expires > now + 60000
+  ) {
     return b2AuthCache;
   }
 
   const keyId = env?.B2_KEY_ID;
   const appKey = env?.B2_APP_KEY;
-  if (!keyId || !appKey) throw new Error("B2 credentials missing");
 
-  const authResp = await fetch("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", {
-    headers: { "Authorization": "Basic " + btoa(`${keyId}:${appKey}`) }
-  });
-  if (!authResp.ok) throw new Error("B2 auth failed");
+  if (!keyId || !appKey) {
+    throw new Error(
+      "B2 credentials missing"
+    );
+  }
+
+  const authResp = await fetch(
+    "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
+    {
+      headers: {
+        "Authorization":
+          "Basic " +
+          btoa(`${keyId}:${appKey}`)
+      }
+    }
+  );
+
+  if (!authResp.ok) {
+    const text = await safeReadText(authResp);
+
+    throw new Error(
+      `B2 auth failed: HTTP ${authResp.status} ${text.slice(0, 500)}`
+    );
+  }
+
   const authData = await authResp.json();
 
   b2AuthCache = {
@@ -137,656 +620,7770 @@ async function getB2Auth(env) {
     apiUrl: authData.apiUrl,
     downloadUrl: authData.downloadUrl,
     accountId: authData.accountId,
-    expires: now + (23 * 60 * 60 * 1000) // Cache 23 jam
+    recommendedPartSize:
+      Number(authData.recommendedPartSize) || null,
+    expires:
+      now + (23 * 60 * 60 * 1000)
   };
+
   return b2AuthCache;
 }
 
-function shouldMirrorKv(env) {
-  const raw = env?.VIDEY_KV_WRITE_ENABLED;
-  if (typeof raw === "boolean") return raw;
-  if (typeof raw === "string") return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
-  return DEFAULT_KV_MIRROR;
+// ============================================================
+// B2 BUCKET
+// ============================================================
+
+async function getB2BucketId(env, auth) {
+  const bucketName = env?.B2_BUCKET_NAME;
+
+  if (!bucketName) {
+    throw new Error(
+      "B2_BUCKET_NAME belum disetting"
+    );
+  }
+
+  let bucketId = env?.B2_BUCKET_ID;
+
+  if (bucketId) {
+    return bucketId;
+  }
+
+  if (
+    b2BucketCache.id &&
+    b2BucketCache.name === bucketName
+  ) {
+    return b2BucketCache.id;
+  }
+
+  const listResp = await fetch(
+    `${auth.apiUrl}/b2api/v2/b2_list_buckets`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": auth.token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        accountId: auth.accountId,
+        bucketName
+      })
+    }
+  );
+
+  if (!listResp.ok) {
+    const text = await safeReadText(listResp);
+
+    throw new Error(
+      `B2 list buckets failed: HTTP ${listResp.status} ${text.slice(0, 500)}`
+    );
+  }
+
+  const listData = await listResp.json();
+
+  const bucket =
+    (listData.buckets || []).find(
+      b => b.bucketName === bucketName
+    );
+
+  if (!bucket) {
+    throw new Error(
+      `B2 bucket '${bucketName}' tidak ditemukan`
+    );
+  }
+
+  b2BucketCache = {
+    id: bucket.bucketId,
+    name: bucketName
+  };
+
+  return bucket.bucketId;
 }
 
-function isUniqueConstraintError(err) {
-  const msg = String(err?.message || err || "");
-  return /UNIQUE constraint failed|constraint failed|PRIMARY KEY constraint failed/i.test(msg);
-}
+// ============================================================
+// B2 START LARGE FILE
+// ============================================================
 
-function normalizeRecord(record) {
-  if (!record || typeof record !== "object") return record;
-  const order = Number(record.order ?? record.order_num ?? record.orderNum ?? 0) || null;
+async function b2StartLargeFile(
+  env,
+  fileName,
+  contentType
+) {
+  const auth = await getB2Auth(env);
+  const bucketId =
+    await getB2BucketId(env, auth);
+
+  const resp = await fetch(
+    `${auth.apiUrl}/b2api/v4/b2_start_large_file`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": auth.token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        bucketId,
+        fileName,
+        contentType: contentType || "video/mp4"
+      })
+    }
+  );
+
+  const text = await safeReadText(resp);
+
+  if (!resp.ok) {
+    throw new Error(
+      `b2_start_large_file failed: HTTP ${resp.status} ${text.slice(0, 1000)}`
+    );
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      "B2 start large file mengembalikan JSON tidak valid"
+    );
+  }
+
+  if (!data.fileId) {
+    throw new Error(
+      "B2 start large file tidak mengembalikan fileId"
+    );
+  }
+
   return {
-    title: record.title ?? "",
-    slug: record.slug ?? "",
-    order,
-    mode: record.mode ?? "",
-    createdAt: record.createdAt ?? record.created_at ?? "",
-    videyId: record.videyId ?? record.videy_id ?? null,
-    sourceUrl: record.sourceUrl ?? record.source_url ?? null,
-    b2FileName: record.b2FileName ?? record.b2_file_name ?? null,
+    auth,
+    bucketId,
+    fileId: data.fileId,
+    fileName: data.fileName || fileName
   };
 }
 
-function parsePositiveInt(value, fallback) {
-  const n = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
+// ============================================================
+// B2 GET PART URL
+// ============================================================
 
-function clampInt(value, fallback, min, max) {
-  const n = parsePositiveInt(value, fallback);
-  return Math.min(max, Math.max(min, n));
-}
+async function b2GetUploadPartUrl(
+  env,
+  fileId
+) {
+  const auth = await getB2Auth(env);
 
-function parsePagination(url, defaultLimit, maxLimit) {
-  const page = clampInt(url.searchParams.get("page"), 1, 1, 1000000);
-  const limit = clampInt(url.searchParams.get("limit"), defaultLimit, 1, maxLimit);
-  return { page, limit, offset: (page - 1) * limit };
-}
-
-function parseKvPagination(url) {
-  const limit = clampInt(url.searchParams.get("limit"), DEFAULT_LEGACY_LIMIT, 1, MAX_LEGACY_LIMIT);
-  const cursor = clean(url.searchParams.get("cursor"));
-  return { limit, cursor: cursor || null };
-}
-
-async function getMaxOrderFromKv(env) {
-  if (!env?.VIDEY_KV) return 0;
-  const out = [];
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
-  for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
-    if (!raw) continue;
-    try {
-      const record = JSON.parse(raw);
-      const ord = Number(record.order || 0);
-      if (ord > 0) out.push(ord);
-    } catch { continue; }
-  }
-  return out.length ? Math.max(...out) : 0;
-}
-
-async function seedOrderCounter(env) {
-  const db = getD1(env);
-  if (!db) return 0;
-  await ensureD1Schema(env);
-  const currentCounterRow = await db.prepare(`SELECT value FROM ${D1_COUNTERS_TABLE} WHERE name = ? LIMIT 1`).bind(D1_COUNTER_NAME).first();
-  const d1MaxRow = await db.prepare(`SELECT COALESCE(MAX(order_num), 0) AS maxOrder FROM ${D1_VIDEOS_TABLE}`).first();
-  const kvMax = await getMaxOrderFromKv(env);
-  const currentCounter = Number(currentCounterRow?.value || 0);
-  const d1Max = Number(d1MaxRow?.maxOrder || 0);
-  const target = Math.max(currentCounter, d1Max, kvMax);
-
-  if (currentCounterRow) {
-    if (currentCounter < target) {
-      await db.prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = ? WHERE name = ?`).bind(target, D1_COUNTER_NAME).run();
+  const resp = await fetch(
+    `${auth.apiUrl}/b2api/v4/b2_get_upload_part_url`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": auth.token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        fileId
+      })
     }
-    return target;
+  );
+
+  const text = await safeReadText(resp);
+
+  if (!resp.ok) {
+    throw new Error(
+      `b2_get_upload_part_url failed: HTTP ${resp.status} ${text.slice(0, 1000)}`
+    );
   }
+
+  let data;
+
   try {
-    await db.prepare(`INSERT INTO ${D1_COUNTERS_TABLE} (name, value) VALUES (?, ?)`).bind(D1_COUNTER_NAME, target).run();
-  } catch (err) {
-    if (!isUniqueConstraintError(err)) throw err;
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      "B2 part URL response bukan JSON valid"
+    );
   }
-  return target;
+
+  if (
+    !data.uploadUrl ||
+    !data.authorizationToken
+  ) {
+    throw new Error(
+      "B2 part URL tidak lengkap"
+    );
+  }
+
+  return data;
 }
 
-async function reserveOrder(env) {
-  const db = getD1(env);
-  if (!db) return await allocateOrderFromKV(env);
-  await seedOrderCounter(env);
-  let row = await db.prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = value + 1 WHERE name = ? RETURNING value`).bind(D1_COUNTER_NAME).first();
-  let order = Number(row?.value || 0);
-  if (!order) {
-    await seedOrderCounter(env);
-    row = await db.prepare(`UPDATE ${D1_COUNTERS_TABLE} SET value = value + 1 WHERE name = ? RETURNING value`).bind(D1_COUNTER_NAME).first();
-    order = Number(row?.value || 0);
-  }
-  if (order) return order;
-  return await allocateOrderFromKV(env);
-}
+// ============================================================
+// B2 UPLOAD PART
+// ============================================================
 
-async function allocateOrderFromKV(env) {
-  if (!env?.VIDEY_KV) return 1;
-  const result = await env.VIDEY_KV.list({ prefix: VIDEO_PREFIX, limit: 1000 });
-  let maxOrder = 0;
-  for (const key of result.keys) {
-    const raw = await env.VIDEY_KV.get(key.name);
-    if (!raw) continue;
+async function b2UploadPart(
+  uploadData,
+  partNumber,
+  body,
+  size,
+  sha1,
+  debug = false
+) {
+  if (!uploadData?.uploadUrl) {
+    throw new Error(
+      "uploadUrl B2 kosong"
+    );
+  }
+
+  if (!body) {
+    throw new Error(
+      "request.body kosong"
+    );
+  }
+
+  if (!Number.isInteger(partNumber)) {
+    throw new Error(
+      "partNumber tidak valid"
+    );
+  }
+
+  if (
+    partNumber < 1 ||
+    partNumber > MAX_B2_PARTS
+  ) {
+    throw new Error(
+      `partNumber harus 1-${MAX_B2_PARTS}`
+    );
+  }
+
+  if (!Number.isInteger(size) || size <= 0) {
+    throw new Error(
+      "Content-Length part tidak valid"
+    );
+  }
+
+  if (!/^[a-f0-9]{40}$/i.test(sha1)) {
+    throw new Error(
+      "SHA1 part tidak valid"
+    );
+  }
+
+  const started = Date.now();
+
+  const headers = new Headers();
+
+  headers.set(
+    "Authorization",
+    uploadData.authorizationToken
+  );
+
+  headers.set(
+    "X-Bz-Part-Number",
+    String(partNumber)
+  );
+
+  headers.set(
+    "Content-Length",
+    String(size)
+  );
+
+  headers.set(
+    "X-Bz-Content-Sha1",
+    sha1.toLowerCase()
+  );
+
+  headers.set(
+    "Content-Type",
+    "application/octet-stream"
+  );
+
+  const resp = await fetch(
+    uploadData.uploadUrl,
+    {
+      method: "POST",
+      headers,
+      body
+    }
+  );
+
+  const text = await safeReadText(
+    resp
+  );
+
+  const elapsed =
+    Date.now() - started;
+
+  if (!resp.ok) {
+    if (debug) {
+      console.log(
+        "[B2 PART ERROR]",
+        JSON.stringify({
+          status: resp.status,
+          elapsed,
+          partNumber,
+          size,
+          sha1,
+          response: text.slice(0, 1000)
+        })
+      );
+    }
+
+    throw new Error(
+      `b2_upload_part failed: HTTP ${resp.status} ${text.slice(0, 1000)}`
+    );
+  }
+
+  let data = null;
+
+  if (text) {
     try {
-      const record = JSON.parse(raw);
-      const ord = Number(record.order || 0);
-      if (ord > maxOrder) maxOrder = ord;
-    } catch { continue; }
-  }
-  return maxOrder + 1;
-}
-
-async function allocateOrder(env) {
-  const db = getD1(env);
-  if (db) return await reserveOrder(env);
-  return await allocateOrderFromKV(env);
-}
-
-async function handleUpload(request, env, url) {
-  const form = await request.formData();
-  const title = clean(form.get("title"));
-  const visitorIdInput = clean(form.get("visitorId"));
-  const sourceUrl = clean(form.get("sourceUrl"));
-  const modeInput = clean(form.get("mode")).toLowerCase();
-  const file = form.get("file");
-
-  const visitorId = visitorIdInput || DEFAULT_VISITOR_ID;
-  let mode = modeInput || (sourceUrl ? "proxy" : "videy");
-  if (!["videy", "proxy", "b2"].includes(mode)) mode = sourceUrl ? "proxy" : "videy";
-  if (mode === "proxy" && !sourceUrl) mode = "videy";
-  const createdAt = new Date().toISOString();
-
-  if (!title) return respondUploadError("Judul wajib diisi.", { mode }, 400, request);
-
-  if (mode === "proxy") {
-    if (!isValidHttpUrl(sourceUrl)) return respondUploadError("URL sumber proxy tidak valid.", { mode }, 400, request);
-    const baseSlug = slugify(title);
-    const slugCandidate = await uniqueSlug(env, baseSlug);
-    const saved = await saveRecord(env, { title, slug: slugCandidate, mode: "proxy", sourceUrl, createdAt });
-    const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
-    const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
-    const key = makeVideoKey(saved.order, saved.slug);
-    const payload = { title: saved.title, slug: saved.slug, order: saved.order, mode: saved.mode, createdAt: saved.createdAt, sourceUrl: saved.sourceUrl };
-    
-    let kvMirrored = false, kvError = "";
-    if (shouldMirrorKv(env) && env?.VIDEY_KV) {
-      try { await env.VIDEY_KV.put(key, JSON.stringify(payload)); kvMirrored = true; } 
-      catch (err) { kvError = err?.message || String(err); }
-    }
-    
-    return respondUploadSuccess({ publicUrl, apiUrl, order: saved.order, slug: saved.slug, mode, title, message: kvMirrored ? (saved.storedInD1 ? "Proxy link tersimpan di D1 dan KV." : "Proxy link tersimpan di KV.") : saved.storedInD1 ? "Proxy link tersimpan di D1." : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`, storage: { d1: !!saved.storedInD1, kv: kvMirrored } }, request);
-  }
-
-  if (mode === "b2") {
-    if (!(file instanceof File) || file.size <= 0) return respondUploadError("File video wajib dipilih untuk mode B2.", { mode }, 400, request);
-    const baseSlug = slugify(title);
-    const upload = await uploadToB2(file, baseSlug, env);
-    if (!upload.ok) return respondUploadError(`Upload B2 gagal: ${upload.error}`, { mode, raw: upload.raw }, 502, request);
-    
-    const slugCandidate = await uniqueSlug(env, baseSlug);
-    const saved = await saveRecord(env, { title, slug: slugCandidate, mode: "b2", sourceUrl: upload.publicUrl, b2FileName: upload.fileName, createdAt });
-    const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
-    const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
-    const key = makeVideoKey(saved.order, saved.slug);
-    const payload = { title: saved.title, slug: saved.slug, order: saved.order, mode: saved.mode, createdAt: saved.createdAt, sourceUrl: saved.sourceUrl, b2FileName: saved.b2FileName };
-    
-    let kvMirrored = false, kvError = "";
-    if (shouldMirrorKv(env) && env?.VIDEY_KV) {
-      try { await env.VIDEY_KV.put(key, JSON.stringify(payload)); kvMirrored = true; } 
-      catch (err) { kvError = err?.message || String(err); }
-    }
-    
-    return respondUploadSuccess({ publicUrl, apiUrl, order: saved.order, slug: saved.slug, mode, title, message: kvMirrored ? (saved.storedInD1 ? "File B2 berhasil disimpan ke D1 dan KV." : "File B2 berhasil disimpan ke KV.") : saved.storedInD1 ? "File B2 berhasil disimpan ke D1." : `File B2 berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`, storage: { d1: !!saved.storedInD1, kv: kvMirrored } }, request);
-  }
-
-  if (!(file instanceof File) || file.size <= 0) return respondUploadError("File video wajib dipilih.", { mode }, 400, request);
-  const upload = await uploadToVidey(file, visitorId, env);
-  if (!upload.ok) return respondUploadError("Videy tidak mengembalikan ID video yang valid.", { mode, status: upload.status, contentType: upload.contentType, location: upload.location, rawJson: upload.rawJson, rawText: upload.rawText }, 502, request);
-  
-  const baseSlug = slugify(title);
-  const slugCandidate = await uniqueSlug(env, baseSlug);
-  const saved = await saveRecord(env, { title, slug: slugCandidate, mode: "videy", videyId: upload.videyId, createdAt });
-  const publicUrl = `${url.origin}/${saved.order}/${saved.slug}.mp4`;
-  const apiUrl = `${url.origin}/api/video/${saved.order}/${saved.slug}`;
-  const key = makeVideoKey(saved.order, saved.slug);
-  const payload = { title: saved.title, slug: saved.slug, order: saved.order, mode: saved.mode, createdAt: saved.createdAt, videyId: saved.videyId };
-  
-  let kvMirrored = false, kvError = "";
-  if (shouldMirrorKv(env) && env?.VIDEY_KV) {
-    try { await env.VIDEY_KV.put(key, JSON.stringify(payload)); kvMirrored = true; } 
-    catch (err) { kvError = err?.message || String(err); }
-  }
-  
-  return respondUploadSuccess({ publicUrl, apiUrl, order: saved.order, slug: saved.slug, mode, title, videyId: upload.videyId, message: kvMirrored ? (saved.storedInD1 ? "ID asli Videy berhasil disimpan ke D1 dan KV." : "ID asli Videy berhasil disimpan ke KV.") : saved.storedInD1 ? "ID asli Videy berhasil disimpan ke D1." : `ID asli Videy berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`, storage: { d1: !!saved.storedInD1, kv: kvMirrored } }, request);
-}
-
-async function saveRecord(env, draft) {
-  const db = getD1(env);
-  if (!db) {
-    const slug = await uniqueSlug(env, draft.slug);
-    const order = await allocateOrderFromKV(env);
-    return { ...draft, slug, order, storedInD1: false };
-  }
-  await ensureD1Schema(env);
-  await seedOrderCounter(env);
-  let order = await reserveOrder(env);
-  let slug = draft.slug;
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    try {
-      await db.prepare(`INSERT INTO ${D1_VIDEOS_TABLE} (order_num, slug, title, mode, videy_id, source_url, b2_file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-        .bind(order, slug, draft.title, draft.mode, draft.videyId ?? null, draft.sourceUrl ?? null, draft.b2FileName ?? null, draft.createdAt).run();
-      return { ...draft, slug, order, storedInD1: true };
-    } catch (err) {
-      if (!isUniqueConstraintError(err)) throw err;
-      const msg = String(err?.message || "");
-      if (/slug/i.test(msg)) { slug = `${draft.slug}-${attempt + 1}`; continue; }
-      if (/order_num|PRIMARY KEY/i.test(msg)) { order = await reserveOrder(env); continue; }
-      throw err;
+      data = JSON.parse(text);
+    } catch {
+      data = {
+        raw: text.slice(0, 1000)
+      };
     }
   }
-  throw new Error("Gagal menyimpan metadata ke D1.");
+
+  if (debug) {
+    console.log(
+      "[B2 PART OK]",
+      JSON.stringify({
+        status: resp.status,
+        elapsed,
+        partNumber,
+        size,
+        sha1,
+        fileId: data?.fileId || null,
+        action: data?.action || null
+      })
+    );
+  }
+
+  return {
+    ok: true,
+    data
+  };
 }
 
-async function uploadToB2(file, slugBase, env) {
+// ============================================================
+// B2 FINISH LARGE FILE
+// ============================================================
+
+async function b2FinishLargeFile(
+  env,
+  fileId,
+  partSha1Array
+) {
+  if (!fileId) {
+    throw new Error(
+      "fileId kosong"
+    );
+  }
+
+  if (
+    !Array.isArray(partSha1Array) ||
+    !partSha1Array.length
+  ) {
+    throw new Error(
+      "partSha1Array kosong"
+    );
+  }
+
+  if (
+    partSha1Array.length >
+    MAX_B2_PARTS
+  ) {
+    throw new Error(
+      `Part terlalu banyak. Maks ${MAX_B2_PARTS}`
+    );
+  }
+
+  for (const sha1 of partSha1Array) {
+    if (!/^[a-f0-9]{40}$/i.test(sha1)) {
+      throw new Error(
+        `SHA1 tidak valid: ${sha1}`
+      );
+    }
+  }
+
+  const auth = await getB2Auth(env);
+
+  const resp = await fetch(
+    `${auth.apiUrl}/b2api/v4/b2_finish_large_file`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": auth.token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        fileId,
+        partSha1Array
+      })
+    }
+  );
+
+  const text = await safeReadText(
+    resp
+  );
+
+  if (!resp.ok) {
+    throw new Error(
+      `b2_finish_large_file failed: HTTP ${resp.status} ${text.slice(0, 1200)}`
+    );
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      "B2 finish mengembalikan JSON tidak valid"
+    );
+  }
+
+  return data;
+}
+
+// ============================================================
+// OLD B2 UPLOAD
+// ============================================================
+
+async function uploadToB2(
+  file,
+  slugBase,
+  env
+) {
   const keyId = env?.B2_KEY_ID;
   const appKey = env?.B2_APP_KEY;
   const bucketName = env?.B2_BUCKET_NAME;
-  if (!keyId || !appKey) return { ok: false, error: "B2 credentials (B2_KEY_ID / B2_APP_KEY) belum disetting" };
+
+  if (!keyId || !appKey) {
+    return {
+      ok: false,
+      error:
+        "B2 credentials (B2_KEY_ID / B2_APP_KEY) belum disetting"
+    };
+  }
+
+  if (!bucketName) {
+    return {
+      ok: false,
+      error:
+        "B2_BUCKET_NAME belum disetting"
+    };
+  }
 
   try {
     const auth = await getB2Auth(env);
-    let bucketId = env?.B2_BUCKET_ID;
-    
-    if (!bucketId) {
-      if (b2BucketCache.id && b2BucketCache.name === bucketName) {
-        bucketId = b2BucketCache.id;
-      } else {
-        const listResp = await fetch(`${auth.apiUrl}/b2api/v2/b2_list_buckets`, {
-          method: "POST", headers: { "Authorization": auth.token, "Content-Type": "application/json" },
-          body: JSON.stringify({ accountId: auth.accountId, bucketName })
-        });
-        if (!listResp.ok) return { ok: false, error: "B2 list buckets failed" };
-        const listData = await listResp.json();
-        const bucket = listData.buckets.find(b => b.bucketName === bucketName);
-        if (!bucket) return { ok: false, error: `B2 bucket '${bucketName}' tidak ditemukan` };
-        bucketId = bucket.bucketId;
-        b2BucketCache = { id: bucketId, name: bucketName };
+    const bucketId =
+      await getB2BucketId(env, auth);
+
+    const getUrlResp = await fetch(
+      `${auth.apiUrl}/b2api/v2/b2_get_upload_url`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": auth.token,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          bucketId
+        })
+      }
+    );
+
+    if (!getUrlResp.ok) {
+      return {
+        ok: false,
+        error:
+          "B2 get upload url failed",
+        raw:
+          (await safeReadText(getUrlResp)).slice(0, 1000)
+      };
+    }
+
+    const uploadData =
+      await getUrlResp.json();
+
+    const fileName =
+      `${Date.now()}-${slugBase}.mp4`;
+
+    // Legacy API tetap seperti sebelumnya.
+    const arrayBuffer =
+      await file.arrayBuffer();
+
+    const uploadResp =
+      await fetch(
+        uploadData.uploadUrl,
+        {
+          method: "POST",
+          headers: {
+            "Authorization":
+              uploadData.authorizationToken,
+
+            "X-Bz-File-Name":
+              encodeURIComponent(fileName),
+
+            "Content-Type":
+              file.type ||
+              "video/mp4",
+
+            "X-Bz-Content-Sha1":
+              "do_not_verify",
+
+            "Content-Length":
+              String(arrayBuffer.byteLength)
+          },
+          body: arrayBuffer
+        }
+      );
+
+    if (!uploadResp.ok) {
+      return {
+        ok: false,
+        error:
+          "B2 upload gagal",
+        raw:
+          (await safeReadText(uploadResp)).slice(0, 1000)
+      };
+    }
+
+    const uploadResult =
+      await uploadResp.json();
+
+    const publicUrl =
+      `${auth.downloadUrl}/file/` +
+      `${encodeURIComponent(bucketName)}/` +
+      `${encodeURIComponent(fileName)}`;
+
+    return {
+      ok: true,
+      b2FileId:
+        uploadResult.fileId,
+
+      publicUrl,
+
+      fileName
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err.message ||
+        String(err)
+    };
+  }
+}
+
+// ============================================================
+// CHUNK HELPERS
+// ============================================================
+
+function getChunkSizeFromEnv(env) {
+  const raw =
+    Number(env?.B2_CHUNK_SIZE);
+
+  if (
+    Number.isFinite(raw) &&
+    raw >= MIN_CHUNK_SIZE &&
+    raw <= MAX_CHUNK_SIZE
+  ) {
+    return Math.floor(raw);
+  }
+
+  return DEFAULT_CHUNK_SIZE;
+}
+
+function getChunkSessionId(url, request) {
+  return clean(
+    url.searchParams.get("uploadId") ||
+    request.headers.get("X-Upload-Id")
+  );
+}
+
+function getPartNumber(url, request) {
+  const value =
+    url.searchParams.get("partNumber") ||
+    request.headers.get("X-Part-Number");
+
+  const n =
+    Number.parseInt(
+      String(value || ""),
+      10
+    );
+
+  if (
+    !Number.isInteger(n) ||
+    n < 1 ||
+    n > MAX_B2_PARTS
+  ) {
+    return null;
+  }
+
+  return n;
+}
+
+function getChunkSha1(request) {
+  return clean(
+    request.headers.get(
+      "X-Chunk-Sha1"
+    ) || ""
+  ).toLowerCase();
+}
+
+function getChunkContentLength(request) {
+  const header =
+    request.headers.get(
+      "Content-Length"
+    );
+
+  const n =
+    Number.parseInt(
+      String(header || ""),
+      10
+    );
+
+  return Number.isInteger(n)
+    ? n
+    : null;
+}
+
+function validateUploadSize(
+  fileSize,
+  chunkSize
+) {
+  if (
+    !Number.isSafeInteger(fileSize) ||
+    fileSize <= 0
+  ) {
+    throw new Error(
+      "fileSize tidak valid"
+    );
+  }
+
+  if (
+    fileSize >
+    MAX_UPLOAD_SIZE
+  ) {
+    throw new Error(
+      "Ukuran file melebihi batas upload"
+    );
+  }
+
+  if (
+    !Number.isInteger(chunkSize) ||
+    chunkSize < MIN_CHUNK_SIZE ||
+    chunkSize > MAX_CHUNK_SIZE
+  ) {
+    throw new Error(
+      "chunkSize tidak valid"
+    );
+  }
+
+  const totalParts =
+    Math.ceil(
+      fileSize /
+      chunkSize
+    );
+
+  if (
+    totalParts < 2
+  ) {
+    throw new Error(
+      "Chunked upload dipakai untuk file besar. "
+      + "Gunakan upload biasa untuk file kecil."
+    );
+  }
+
+  if (
+    totalParts >
+    MAX_B2_PARTS
+  ) {
+    throw new Error(
+      `Jumlah part ${totalParts} melebihi maksimum ${MAX_B2_PARTS}`
+    );
+  }
+
+  return totalParts;
+}
+
+function randomToken(bytes = UPLOAD_TOKEN_BYTES) {
+  const data =
+    new Uint8Array(bytes);
+
+  crypto.getRandomValues(data);
+
+  let binary = "";
+
+  for (const byte of data) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function makeChunkHeaders(
+  requestId
+) {
+  return {
+    "Cache-Control": "no-store",
+    "X-Request-Id":
+      requestId,
+    "Access-Control-Allow-Origin":
+      "*",
+    "Access-Control-Allow-Headers":
+      "Content-Type, X-Upload-Id, X-Upload-Token, X-Part-Number, X-Chunk-Sha1, X-Chunk-Size, X-Upload-Debug",
+    "Access-Control-Allow-Methods":
+      "GET, POST, PUT, OPTIONS"
+  };
+}
+
+async function readJsonRequest(
+  request
+) {
+  const text =
+    await request.text();
+
+  if (!text) {
+    throw new Error(
+      "JSON body kosong"
+    );
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      "JSON body tidak valid"
+    );
+  }
+}
+
+// ============================================================
+// CHUNK INIT
+// ============================================================
+
+async function handleChunkInit(
+  request,
+  env,
+  url,
+  requestId
+) {
+  const debug =
+    isDebugRequest(request);
+
+  const started =
+    Date.now();
+
+  try {
+    const db =
+      getD1(env);
+
+    if (!db) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "d1_not_available",
+          requestId
+        },
+        503,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    await ensureD1Schema(env);
+
+    const body =
+      await readJsonRequest(request);
+
+    const title =
+      clean(body.title);
+
+    const fileNameInput =
+      clean(body.fileName);
+
+    const contentType =
+      clean(body.contentType) ||
+      "video/mp4";
+
+    const fileSize =
+      Number(body.fileSize);
+
+    let chunkSize =
+      Number(body.chunkSize);
+
+    if (!title) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Judul wajib diisi",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      !Number.isSafeInteger(fileSize) ||
+      fileSize <= 0
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "fileSize wajib berupa integer positif",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      !Number.isInteger(chunkSize)
+    ) {
+      chunkSize =
+        getChunkSizeFromEnv(env);
+    }
+
+    chunkSize =
+      Math.min(
+        MAX_CHUNK_SIZE,
+        Math.max(
+          MIN_CHUNK_SIZE,
+          Math.floor(chunkSize)
+        )
+      );
+
+    // Force 50 MiB by default bila tidak ditentukan.
+    if (!body.chunkSize) {
+      chunkSize =
+        getChunkSizeFromEnv(env);
+    }
+
+    let totalParts;
+
+    try {
+      totalParts =
+        validateUploadSize(
+          fileSize,
+          chunkSize
+        );
+    } catch (err) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            err.message,
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    const baseSlug =
+      slugify(
+        title
+      );
+
+    const extension =
+      getSafeExtension(
+        fileNameInput,
+        contentType
+      );
+
+    const fileName =
+      `${Date.now()}-${baseSlug}${extension}`;
+
+    console.log(
+      "[CHUNK INIT]",
+      JSON.stringify({
+        requestId,
+        title,
+        fileName,
+        fileSize,
+        chunkSize,
+        totalParts,
+        contentType
+      })
+    );
+
+    const large =
+      await b2StartLargeFile(
+        env,
+        fileName,
+        contentType
+      );
+
+    const uploadId =
+      crypto.randomUUID();
+
+    const sessionToken =
+      randomToken();
+
+    const now =
+      new Date().toISOString();
+
+    await db
+      .prepare(`
+        INSERT INTO ${D1_UPLOAD_SESSIONS_TABLE}
+        (
+          upload_id,
+          session_token,
+          title,
+          base_slug,
+          file_name,
+          content_type,
+          file_size,
+          chunk_size,
+          total_parts,
+          b2_file_id,
+          created_at,
+          updated_at,
+          status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(
+        uploadId,
+        sessionToken,
+        title,
+        baseSlug,
+        fileName,
+        contentType,
+        fileSize,
+        chunkSize,
+        totalParts,
+        large.fileId,
+        now,
+        now,
+        "active"
+      )
+      .run();
+
+    const result = {
+      ok: true,
+      uploadId,
+      uploadToken: sessionToken,
+      fileName,
+      fileSize,
+      chunkSize,
+      totalParts,
+      minChunkSize:
+        MIN_CHUNK_SIZE,
+      maxChunkSize:
+        MAX_CHUNK_SIZE,
+      mode: "b2",
+      method: "chunked-b2",
+      expiresAt:
+        new Date(
+          Date.now() +
+          CHUNK_UPLOAD_EXPIRY_MS
+        ).toISOString(),
+      requestId
+    };
+
+    if (debug) {
+      result.debug = {
+        elapsedMs:
+          Date.now() -
+          started,
+        b2FileId:
+          large.fileId,
+        b2BucketId:
+          large.bucketId,
+        recommendedPartSize:
+          b2AuthCache.recommendedPartSize,
+        source:
+          "b2_start_large_file"
+      };
+    }
+
+    return jsonResponse(
+      result,
+      200,
+      makeChunkHeaders(requestId)
+    );
+  } catch (err) {
+    console.error(
+      "[CHUNK INIT ERROR]",
+      requestId,
+      err
+    );
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          err.message ||
+          String(err),
+        requestId,
+        debug: debug
+          ? {
+              stage:
+                "init",
+              elapsedMs:
+                Date.now() -
+                started
+            }
+          : undefined
+      },
+      500,
+      makeChunkHeaders(requestId)
+    );
+  }
+}
+
+// ============================================================
+// CHUNK PART
+// ============================================================
+
+async function handleChunkPart(
+  request,
+  env,
+  requestId
+) {
+  const debug =
+    isDebugRequest(request);
+
+  const started =
+    Date.now();
+
+  try {
+    const db =
+      getD1(env);
+
+    if (!db) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "d1_not_available",
+          requestId
+        },
+        503,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    await ensureD1Schema(env);
+
+    const url =
+      new URL(
+        request.url
+      );
+
+    const uploadId =
+      getChunkSessionId(
+        url,
+        request
+      );
+
+    const partNumber =
+      getPartNumber(
+        url,
+        request
+      );
+
+    const sessionToken =
+      clean(
+        request.headers.get(
+          "X-Upload-Token"
+        )
+      );
+
+    const sha1 =
+      getChunkSha1(
+        request
+      );
+
+    const contentLength =
+      getChunkContentLength(
+        request
+      );
+
+    if (!uploadId) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "uploadId wajib",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (!sessionToken) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "X-Upload-Token wajib",
+          requestId
+        },
+        401,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (!partNumber) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "partNumber tidak valid",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (!sha1) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "X-Chunk-Sha1 wajib",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      !/^[a-f0-9]{40}$/i.test(
+        sha1
+      )
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "X-Chunk-Sha1 harus SHA1 40 hex",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      !contentLength ||
+      contentLength <= 0
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Content-Length wajib dan harus > 0",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    // Jangan menerima part jauh lebih besar dari batas.
+    if (
+      contentLength >
+      MAX_CHUNK_SIZE
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            `Chunk terlalu besar. Maks ${MAX_CHUNK_SIZE} byte`,
+          requestId
+        },
+        413,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    const session =
+      await db
+        .prepare(`
+          SELECT *
+          FROM ${D1_UPLOAD_SESSIONS_TABLE}
+          WHERE upload_id = ?
+          LIMIT 1
+        `)
+        .bind(uploadId)
+        .first();
+
+    if (!session) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "upload_session_not_found",
+          requestId
+        },
+        404,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      session.session_token !==
+      sessionToken
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "invalid_upload_token",
+          requestId
+        },
+        403,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      session.status !==
+      "active"
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            `Upload session status=${session.status}`,
+          requestId
+        },
+        409,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    const createdAt =
+      Date.parse(
+        session.created_at
+      );
+
+    if (
+      Number.isFinite(createdAt) &&
+      Date.now() -
+        createdAt >
+        CHUNK_UPLOAD_EXPIRY_MS
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "upload_session_expired",
+          requestId
+        },
+        410,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    const totalParts =
+      Number(
+        session.total_parts
+      );
+
+    const expectedSize =
+      getExpectedPartSize(
+        Number(
+          session.file_size
+        ),
+        Number(
+          session.chunk_size
+        ),
+        totalParts,
+        partNumber
+      );
+
+    if (
+      partNumber <
+        1 ||
+      partNumber >
+        totalParts
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "partNumber di luar rentang",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      contentLength !==
+      expectedSize
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Ukuran chunk tidak sesuai",
+          expectedSize,
+          receivedSize:
+            contentLength,
+          partNumber,
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    // --------------------------------------------------------
+    // IDEMPOTENT RETRY
+    // --------------------------------------------------------
+
+    const existing =
+      await db
+        .prepare(`
+          SELECT
+            part_number,
+            sha1,
+            size
+          FROM ${D1_UPLOAD_PARTS_TABLE}
+          WHERE upload_id = ?
+            AND part_number = ?
+          LIMIT 1
+        `)
+        .bind(
+          uploadId,
+          partNumber
+        )
+        .first();
+
+    if (existing) {
+      if (
+        String(
+          existing.sha1
+        ).toLowerCase() ===
+          sha1 &&
+        Number(
+          existing.size
+        ) === contentLength
+      ) {
+        console.log(
+          "[CHUNK DUPLICATE]",
+          JSON.stringify({
+            requestId,
+            uploadId,
+            partNumber,
+            size:
+              contentLength
+          })
+        );
+
+        return jsonResponse(
+          {
+            ok: true,
+            duplicate: true,
+            uploadId,
+            partNumber,
+            size:
+              contentLength,
+            sha1,
+            elapsedMs:
+              Date.now() -
+              started,
+            requestId
+          },
+          200,
+          makeChunkHeaders(requestId)
+        );
+      }
+
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Part sudah ada dengan SHA1/size berbeda",
+          requestId
+        },
+        409,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    if (
+      !request.body
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Request body kosong",
+          requestId
+        },
+        400,
+        makeChunkHeaders(requestId)
+      );
+    }
+
+    console.log(
+      "[CHUNK PART START]",
+      JSON.stringify({
+        requestId,
+        uploadId,
+        partNumber,
+        totalParts,
+        contentLength,
+        expectedSize,
+        sha1
+      })
+    );
+
+    // --------------------------------------------------------
+    // B2 GET PART URL
+    // --------------------------------------------------------
+
+    const uploadData =
+      await b2GetUploadPartUrl(
+        env,
+        session.b2_file_id
+      );
+
+    // --------------------------------------------------------
+    // DIRECT STREAM
+    // request.body -> B2
+    //
+    // Tidak:
+    // const arrayBuffer = await request.arrayBuffer()
+    //
+    // Jadi chunk tetap streaming dan tidak membebani memory
+    // dengan file besar.
+    // --------------------------------------------------------
+
+    const uploaded =
+      await b2UploadPart(
+        uploadData,
+        partNumber,
+        request.body,
+        contentLength,
+        sha1,
+        debug
+      );
+
+    if (!uploaded.ok) {
+      throw new Error(
+        "B2 upload part gagal"
+      );
+    }
+
+    const now =
+      new Date().toISOString();
+
+    await db
+      .prepare(`
+        INSERT OR REPLACE INTO ${D1_UPLOAD_PARTS_TABLE}
+        (
+          upload_id,
+          part_number,
+          sha1,
+          size,
+          uploaded_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+      `)
+      .bind(
+        uploadId,
+        partNumber,
+        sha1,
+        contentLength,
+        now
+      )
+      .run();
+
+    await db
+      .prepare(`
+        UPDATE ${D1_UPLOAD_SESSIONS_TABLE}
+        SET updated_at = ?
+        WHERE upload_id = ?
+      `)
+      .bind(
+        now,
+        uploadId
+      )
+      .run();
+
+    const partsRow =
+      await db
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM ${D1_UPLOAD_PARTS_TABLE}
+          WHERE upload_id = ?
+        `)
+        .bind(uploadId)
+        .first();
+
+    const uploadedParts =
+      Number(
+        partsRow?.count || 0
+      );
+
+    const response = {
+      ok: true,
+      uploadId,
+      partNumber,
+      totalParts,
+      size:
+        contentLength,
+      sha1,
+      uploadedParts,
+      remainingParts:
+        Math.max(
+          0,
+          totalParts -
+            uploadedParts
+        ),
+      progress:
+        Number(
+          (
+            uploadedParts /
+            totalParts *
+            100
+          ).toFixed(2)
+        ),
+      requestId
+    };
+
+    if (debug) {
+      response.debug = {
+        elapsedMs:
+          Date.now() -
+          started,
+
+        stage:
+          "part",
+
+        b2FileId:
+          session.b2_file_id,
+
+        bodyStream:
+          true
+      };
+    }
+
+    console.log(
+      "[CHUNK PART OK]",
+      JSON.stringify(
+        response
+      )
+    );
+
+    return jsonResponse(
+      response,
+      200,
+      makeChunkHeaders(requestId)
+    );
+  } catch (err) {
+    console.error(
+      "[CHUNK PART ERROR]",
+      requestId,
+      err
+    );
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          err.message ||
+          String(err),
+        requestId,
+
+        debug: debug
+          ? {
+              stage:
+                "part",
+
+              elapsedMs:
+                Date.now() -
+                started
+            }
+          : undefined
+      },
+      500,
+      makeChunkHeaders(requestId)
+    );
+  }
+}
+
+// ============================================================
+// CHUNK STATUS
+// ============================================================
+
+async function handleChunkStatus(
+  request,
+  env,
+  requestId
+) {
+  try {
+    const db =
+      getD1(env);
+
+    if (!db) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "d1_not_available",
+          requestId
+        },
+        503
+      );
+    }
+
+    await ensureD1Schema(env);
+
+    const url =
+      new URL(
+        request.url
+      );
+
+    const uploadId =
+      clean(
+        url.searchParams.get(
+          "uploadId"
+        )
+      );
+
+    const token =
+      clean(
+        request.headers.get(
+          "X-Upload-Token"
+        )
+      );
+
+    if (!uploadId) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "uploadId wajib",
+          requestId
+        },
+        400
+      );
+    }
+
+    if (!token) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "X-Upload-Token wajib",
+          requestId
+        },
+        401
+      );
+    }
+
+    const session =
+      await db
+        .prepare(`
+          SELECT *
+          FROM ${D1_UPLOAD_SESSIONS_TABLE}
+          WHERE upload_id = ?
+          LIMIT 1
+        `)
+        .bind(uploadId)
+        .first();
+
+    if (!session) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "upload_session_not_found",
+          requestId
+        },
+        404
+      );
+    }
+
+    if (
+      session.session_token !==
+      token
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "invalid_upload_token",
+          requestId
+        },
+        403
+      );
+    }
+
+    const partsResult =
+      await db
+        .prepare(`
+          SELECT
+            part_number,
+            sha1,
+            size,
+            uploaded_at
+          FROM ${D1_UPLOAD_PARTS_TABLE}
+          WHERE upload_id = ?
+          ORDER BY part_number ASC
+        `)
+        .bind(uploadId)
+        .all();
+
+    const parts =
+      partsResult.results || [];
+
+    return jsonResponse(
+      {
+        ok: true,
+        uploadId,
+        title:
+          session.title,
+
+        fileName:
+          session.file_name,
+
+        fileSize:
+          Number(session.file_size),
+
+        chunkSize:
+          Number(session.chunk_size),
+
+        totalParts:
+          Number(session.total_parts),
+
+        b2FileId:
+          session.b2_file_id,
+
+        status:
+          session.status,
+
+        uploadedParts:
+          parts.length,
+
+        missingParts:
+          buildMissingParts(
+            Number(
+              session.total_parts
+            ),
+            parts
+          ),
+
+        parts,
+
+        progress:
+          Number(
+            (
+              parts.length /
+              Number(
+                session.total_parts
+              ) *
+              100
+            ).toFixed(2)
+          ),
+
+        createdAt:
+          session.created_at,
+
+        updatedAt:
+          session.updated_at,
+
+        result:
+          session.result_order
+            ? {
+                order:
+                  Number(
+                    session.result_order
+                  ),
+
+                slug:
+                  session.result_slug,
+
+                b2FileName:
+                  session.b2_file_name
+              }
+            : null,
+
+        requestId
+      },
+      200,
+      makeChunkHeaders(requestId)
+    );
+  } catch (err) {
+    console.error(
+      "[CHUNK STATUS]",
+      requestId,
+      err
+    );
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          err.message ||
+          String(err),
+        requestId
+      },
+      500
+    );
+  }
+}
+
+// ============================================================
+// CHUNK COMPLETE
+// ============================================================
+
+async function handleChunkComplete(
+  request,
+  env,
+  url,
+  requestId
+) {
+  const debug =
+    isDebugRequest(request);
+
+  const started =
+    Date.now();
+
+  try {
+    const db =
+      getD1(env);
+
+    if (!db) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "d1_not_available",
+          requestId
+        },
+        503
+      );
+    }
+
+    await ensureD1Schema(env);
+
+    const body =
+      await readJsonRequest(
+        request
+      );
+
+    const uploadId =
+      clean(
+        body.uploadId
+      );
+
+    const uploadToken =
+      clean(
+        body.uploadToken ||
+        request.headers.get(
+          "X-Upload-Token"
+        )
+      );
+
+    if (!uploadId) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "uploadId wajib",
+          requestId
+        },
+        400
+      );
+    }
+
+    if (!uploadToken) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "uploadToken wajib",
+          requestId
+        },
+        401
+      );
+    }
+
+    const session =
+      await db
+        .prepare(`
+          SELECT *
+          FROM ${D1_UPLOAD_SESSIONS_TABLE}
+          WHERE upload_id = ?
+          LIMIT 1
+        `)
+        .bind(uploadId)
+        .first();
+
+    if (!session) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "upload_session_not_found",
+          requestId
+        },
+        404
+      );
+    }
+
+    if (
+      session.session_token !==
+      uploadToken
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "invalid_upload_token",
+          requestId
+        },
+        403
+      );
+    }
+
+    // Idempotent complete
+    if (
+      session.status ===
+      "complete"
+    ) {
+      const result = {
+        ok: true,
+        alreadyComplete: true,
+        uploadId,
+        order:
+          Number(
+            session.result_order
+          ),
+        slug:
+          session.result_slug,
+        b2FileName:
+          session.b2_file_name,
+        publicUrl:
+          `${url.origin}/${session.result_order}/${session.result_slug}.mp4`,
+        apiUrl:
+          `${url.origin}/api/video/${session.result_order}/${session.result_slug}`,
+        requestId
+      };
+
+      if (debug) {
+        result.debug = {
+          stage:
+            "complete-idempotent",
+          elapsedMs:
+            Date.now() -
+            started
+        };
+      }
+
+      return jsonResponse(
+        result,
+        200
+      );
+    }
+
+    if (
+      session.status !==
+      "active"
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            `Session status=${session.status}`,
+          requestId
+        },
+        409
+      );
+    }
+
+    const totalParts =
+      Number(
+        session.total_parts
+      );
+
+    const expectedFileSize =
+      Number(
+        session.file_size
+      );
+
+    const partsResult =
+      await db
+        .prepare(`
+          SELECT
+            part_number,
+            sha1,
+            size
+          FROM ${D1_UPLOAD_PARTS_TABLE}
+          WHERE upload_id = ?
+          ORDER BY part_number ASC
+        `)
+        .bind(uploadId)
+        .all();
+
+    const parts =
+      partsResult.results || [];
+
+    if (
+      parts.length !==
+      totalParts
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Belum semua chunk diterima",
+          expectedParts:
+            totalParts,
+          uploadedParts:
+            parts.length,
+          missingParts:
+            buildMissingParts(
+              totalParts,
+              parts
+            ),
+          requestId
+        },
+        409
+      );
+    }
+
+    let totalSize = 0;
+
+    const sha1Array = [];
+
+    for (
+      let i = 0;
+      i < parts.length;
+      i++
+    ) {
+      const row =
+        parts[i];
+
+      const partNumber =
+        Number(
+          row.part_number
+        );
+
+      if (
+        partNumber !==
+        i + 1
+      ) {
+        return jsonResponse(
+          {
+            ok: false,
+            error:
+              "Nomor part tidak contiguous",
+            expected:
+              i + 1,
+            actual:
+              partNumber,
+            requestId
+          },
+          409
+        );
+      }
+
+      const size =
+        Number(
+          row.size
+        );
+
+      if (
+        !Number.isInteger(
+          size
+        ) ||
+        size <= 0
+      ) {
+        return jsonResponse(
+          {
+            ok: false,
+            error:
+              `Ukuran part ${partNumber} tidak valid`,
+            requestId
+          },
+          409
+        );
+      }
+
+      totalSize +=
+        size;
+
+      const sha1 =
+        String(
+          row.sha1 ||
+          ""
+        ).toLowerCase();
+
+      if (
+        !/^[a-f0-9]{40}$/.test(
+          sha1
+        )
+      ) {
+        return jsonResponse(
+          {
+            ok: false,
+            error:
+              `SHA1 part ${partNumber} tidak valid`,
+            requestId
+          },
+          409
+        );
+      }
+
+      sha1Array.push(
+        sha1
+      );
+    }
+
+    if (
+      totalSize !==
+      expectedFileSize
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Total ukuran part tidak sama dengan fileSize",
+          expectedSize:
+            expectedFileSize,
+          actualSize:
+            totalSize,
+          requestId
+        },
+        409
+      );
+    }
+
+    console.log(
+      "[CHUNK COMPLETE START]",
+      JSON.stringify({
+        requestId,
+        uploadId,
+        totalParts,
+        expectedFileSize,
+        totalSize,
+        b2FileId:
+          session.b2_file_id
+      })
+    );
+
+    // --------------------------------------------------------
+    // B2 FINISH
+    // --------------------------------------------------------
+
+    const finish =
+      await b2FinishLargeFile(
+        env,
+        session.b2_file_id,
+        sha1Array
+      );
+
+    const baseSlug =
+      slugify(
+        session.base_slug ||
+        session.title
+      );
+
+    const slugCandidate =
+      await uniqueSlug(
+        env,
+        baseSlug
+      );
+
+    const createdAt =
+      session.created_at;
+
+    const publicSourceUrl =
+      `${(await getB2Auth(env)).downloadUrl}/file/` +
+      `${encodeURIComponent(env.B2_BUCKET_NAME)}/` +
+      `${encodeURIComponent(session.file_name)}`;
+
+    // --------------------------------------------------------
+    // SAVE RECORD
+    // --------------------------------------------------------
+
+    const saved =
+      await saveRecord(
+        env,
+        {
+          title:
+            session.title,
+
+          slug:
+            slugCandidate,
+
+          mode:
+            "b2",
+
+          sourceUrl:
+            publicSourceUrl,
+
+          b2FileName:
+            session.file_name,
+
+          createdAt
+        }
+      );
+
+    const publicUrl =
+      `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+
+    const apiUrl =
+      `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    const key =
+      makeVideoKey(
+        saved.order,
+        saved.slug
+      );
+
+    const payload = {
+      title:
+        saved.title,
+
+      slug:
+        saved.slug,
+
+      order:
+        saved.order,
+
+      mode:
+        saved.mode,
+
+      createdAt:
+        saved.createdAt,
+
+      sourceUrl:
+        saved.sourceUrl,
+
+      b2FileName:
+        saved.b2FileName
+    };
+
+    let kvMirrored = false;
+    let kvError = "";
+
+    if (
+      shouldMirrorKv(env) &&
+      env?.VIDEY_KV
+    ) {
+      try {
+        await env.VIDEY_KV.put(
+          key,
+          JSON.stringify(
+            payload
+          )
+        );
+
+        kvMirrored = true;
+      } catch (err) {
+        kvError =
+          err?.message ||
+          String(err);
       }
     }
 
-    const getUrlResp = await fetch(`${auth.apiUrl}/b2api/v2/b2_get_upload_url`, {
-      method: "POST", headers: { "Authorization": auth.token, "Content-Type": "application/json" },
-      body: JSON.stringify({ bucketId })
-    });
-    if (!getUrlResp.ok) return { ok: false, error: "B2 get upload url failed" };
-    const uploadData = await getUrlResp.json();
+    // --------------------------------------------------------
+    // MARK SESSION COMPLETE
+    // --------------------------------------------------------
 
-    const fileName = `${Date.now()}-${slugBase}.mp4`;
-    const arrayBuffer = await file.arrayBuffer();
-    
-    const uploadResp = await fetch(uploadData.uploadUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": uploadData.authorizationToken,
-        "X-Bz-File-Name": encodeURIComponent(fileName),
-        "Content-Type": file.type || "video/mp4",
-        "X-Bz-Content-Sha1": "do_not_verify"
+    const now =
+      new Date().toISOString();
+
+    await db
+      .prepare(`
+        UPDATE ${D1_UPLOAD_SESSIONS_TABLE}
+        SET
+          status = ?,
+          updated_at = ?,
+          result_order = ?,
+          result_slug = ?,
+          b2_file_name = ?
+        WHERE upload_id = ?
+      `)
+      .bind(
+        "complete",
+        now,
+        saved.order,
+        saved.slug,
+        saved.b2FileName,
+        uploadId
+      )
+      .run();
+
+    const response = {
+      ok: true,
+      uploadId,
+      alreadyComplete:
+        false,
+
+      order:
+        saved.order,
+
+      slug:
+        saved.slug,
+
+      title:
+        saved.title,
+
+      mode:
+        "b2",
+
+      publicUrl,
+
+      apiUrl,
+
+      b2FileName:
+        saved.b2FileName,
+
+      b2FileId:
+        finish.fileId ||
+        session.b2_file_id,
+
+      storage: {
+        d1:
+          !!saved.storedInD1,
+
+        kv:
+          kvMirrored
       },
-      body: arrayBuffer
-    });
 
-    if (!uploadResp.ok) return { ok: false, error: "B2 upload gagal" };
-    const uploadResult = await uploadResp.json();
-    const publicUrl = `${auth.downloadUrl}/file/${encodeURIComponent(bucketName)}/${encodeURIComponent(fileName)}`;
-    return { ok: true, b2FileId: uploadResult.fileId, publicUrl, fileName };
+      message:
+        kvMirrored
+          ? (
+              saved.storedInD1
+                ? "File B2 chunked berhasil diselesaikan dan metadata tersimpan di D1 + KV."
+                : "File B2 chunked berhasil diselesaikan dan metadata tersimpan di KV."
+            )
+          : (
+              saved.storedInD1
+                ? "File B2 chunked berhasil diselesaikan dan metadata tersimpan di D1."
+                : `File B2 chunked berhasil diselesaikan. Mirror KV gagal: ${kvError || "mirror dimatikan"}`
+            ),
+
+      requestId
+    };
+
+    if (debug) {
+      response.debug = {
+        stage:
+          "complete",
+
+        elapsedMs:
+          Date.now() -
+          started,
+
+        totalParts,
+        totalSize,
+        b2FileId:
+          session.b2_file_id,
+
+        b2Action:
+          finish.action ||
+          "upload"
+      };
+    }
+
+    console.log(
+      "[CHUNK COMPLETE OK]",
+      JSON.stringify(
+        response
+      )
+    );
+
+    return jsonResponse(
+      response,
+      200
+    );
   } catch (err) {
-    return { ok: false, error: err.message || String(err) };
+    console.error(
+      "[CHUNK COMPLETE ERROR]",
+      requestId,
+      err
+    );
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          err.message ||
+          String(err),
+
+        requestId,
+
+        debug: debug
+          ? {
+              stage:
+                "complete",
+
+              elapsedMs:
+                Date.now() -
+                started
+            }
+          : undefined
+      },
+      500
+    );
   }
 }
 
-async function uploadToVidey(file, visitorId, env) {
-  const uploadUrlInput = env?.VIDEY_UPLOAD_URL || DEFAULT_UPLOAD_URL;
-  const uploadField = env?.VIDEY_UPLOAD_FIELD || DEFAULT_UPLOAD_FIELD;
-  const uploadTarget = new URL(uploadUrlInput);
-  if (!uploadTarget.searchParams.has("visitorId")) uploadTarget.searchParams.set("visitorId", visitorId);
+// ============================================================
+// UPLOAD DEBUG
+// ============================================================
 
-  const headers = { "User-Agent": "Mozilla/5.0", Accept: "application/json" };
-  const formData = new FormData();
-  formData.append(uploadField, file, file.name || "video.mp4");
+function isDebugRequest(
+  request
+) {
+  const header =
+    request.headers.get(
+      DEBUG_HEADER
+    );
 
-  const resp = await fetch(uploadTarget.toString(), { method: "POST", headers, body: formData, redirect: "follow" });
-  const contentType = resp.headers.get("content-type") || "";
-  const location = resp.headers.get("location") || "";
-  let rawText = "", rawJson = null;
-
-  if (contentType.includes("application/json")) { try { rawJson = await resp.json(); } catch { rawJson = null; } } 
-  else { try { rawText = await resp.text(); } catch { rawText = ""; } }
-
-  const videyId = extractIdFromJson(rawJson) || extractIdFromText(rawText) || extractIdFromText(JSON.stringify(rawJson || {})) || extractIdFromText(location) || null;
-  return { ok: Boolean(videyId), videyId, status: resp.status, contentType, location, rawJson, rawText: rawText ? rawText.slice(0, MAX_DEBUG_TEXT) : "" };
-}
-
-async function serveVideoByRoute(route, request, env) {
-  const record = await findRecordByRoute(env, route);
-  if (!record) return textResponse("Video tidak ditemukan", 404);
-
-  if (record.mode === "proxy") {
-    return await proxyToUpstream(record.sourceUrl, request, record);
-  }
-  
-  if (record.mode === "b2") {
-    return await streamFromB2(record, request, env);
+  if (
+    header === "1" ||
+    header === "true"
+  ) {
+    return true;
   }
 
-  if (!record.videyId) return textResponse("videyId kosong", 500);
-  const upstreamUrl = `${CDN_BASE}/${encodeURIComponent(record.videyId)}.mp4`;
-  return await proxyToUpstream(upstreamUrl, request, record);
+  const url =
+    new URL(
+      request.url
+    );
+
+  return (
+    url.searchParams.get(
+      "debug"
+    ) === "1"
+  );
 }
 
-async function streamFromB2(record, request, env) {
-  if (!record.b2FileName) return textResponse("B2 filename missing di Database", 500);
+// ============================================================
+// CHUNK UTILITIES
+// ============================================================
 
-  const auth = await getB2Auth(env);
-  const bucketName = env?.B2_BUCKET_NAME || "videy-bucket";
-  const downloadUrl = `${auth.downloadUrl}/file/${encodeURIComponent(bucketName)}/${encodeURIComponent(record.b2FileName)}`;
-
-  const headers = new Headers();
-  copyHeader(request.headers, headers, "Range");
-  copyHeader(request.headers, headers, "If-Range");
-  copyHeader(request.headers, headers, "Accept");
-  copyHeader(request.headers, headers, "User-Agent");
-  copyHeader(request.headers, headers, "Origin");
-  copyHeader(request.headers, headers, "Referer");
-  headers.set("Authorization", auth.token);
-
-  const upstreamResp = await fetch(downloadUrl, { method: "GET", headers, redirect: "follow" });
-
-  if (!upstreamResp.ok && upstreamResp.status !== 206) {
-    return textResponse(`B2 download failed: ${upstreamResp.status}`, upstreamResp.status);
+function getExpectedPartSize(
+  fileSize,
+  chunkSize,
+  totalParts,
+  partNumber
+) {
+  if (
+    partNumber <
+      totalParts
+  ) {
+    return chunkSize;
   }
 
-  const responseHeaders = new Headers(upstreamResp.headers);
-  responseHeaders.set("Access-Control-Allow-Origin", "*");
-  responseHeaders.set("Cache-Control", "public, max-age=3600");
-  responseHeaders.set("X-Video-Order", String(record.order ?? ""));
-  responseHeaders.set("X-Video-Slug", record.slug || "");
-  responseHeaders.set("X-Video-Title", record.title || "");
-  
-  if (!responseHeaders.get("Accept-Ranges")) {
-    responseHeaders.set("Accept-Ranges", "bytes");
+  return (
+    fileSize -
+    chunkSize *
+      (totalParts - 1)
+  );
+}
+
+function buildMissingParts(
+  totalParts,
+  parts
+) {
+  const existing =
+    new Set(
+      (parts || []).map(
+        p =>
+          Number(
+            p.part_number
+          )
+      )
+    );
+
+  const missing = [];
+
+  for (
+    let i = 1;
+    i <= totalParts;
+    i++
+  ) {
+    if (
+      !existing.has(i)
+    ) {
+      missing.push(i);
+    }
   }
 
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    statusText: upstreamResp.statusText,
-    headers: responseHeaders,
-  });
+  return missing;
 }
 
-async function proxyToUpstream(upstreamUrl, request, record) {
-  const upstreamHeaders = new Headers();
-  copyHeader(request.headers, upstreamHeaders, "Range");
-  copyHeader(request.headers, upstreamHeaders, "If-Range");
-  copyHeader(request.headers, upstreamHeaders, "Accept");
-  copyHeader(request.headers, upstreamHeaders, "User-Agent");
-  copyHeader(request.headers, upstreamHeaders, "Origin");
-  copyHeader(request.headers, upstreamHeaders, "Referer");
+function getSafeExtension(
+  fileName,
+  contentType
+) {
+  const cleanName =
+    String(
+      fileName || ""
+    )
+    .split("/")
+    .pop()
+    .split("\\")
+    .pop();
 
-  const upstreamResp = await fetch(upstreamUrl, { method: "GET", headers: upstreamHeaders, redirect: "follow" });
-  const headers = new Headers(upstreamResp.headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Cache-Control", "public, max-age=3600");
-  headers.set("X-Video-Order", String(record.order ?? ""));
-  headers.set("X-Video-Slug", record.slug || "");
-  headers.set("X-Video-Title", record.title || "");
-  if (!headers.get("Content-Type")) headers.set("Content-Type", "video/mp4");
+  const match =
+    cleanName.match(
+      /(\.[a-zA-Z0-9]{1,10})$/
+    );
 
-  return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  if (match) {
+    return match[1]
+      .toLowerCase();
+  }
+
+  const map = {
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/quicktime": ".mov",
+    "video/x-msvideo": ".avi"
+  };
+
+  return (
+    map[contentType] ||
+    ".mp4"
+  );
 }
 
-async function handleApiVideo(env, order, slug) {
-  const record = await findRecordByRoute(env, { order, slug });
-  if (!record) return jsonResponse({ ok: false, error: "not_found" }, 404);
-  return jsonResponse({ ok: true, data: publicRecord(record) });
+async function safeReadText(
+  response
+) {
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
 }
 
-async function handleList(env, url, request) {
-  const db = getD1(env);
+// ============================================================
+// KV
+// ============================================================
+
+function shouldMirrorKv(
+  env
+) {
+  const raw =
+    env?.VIDEY_KV_WRITE_ENABLED;
+
+  if (
+    typeof raw === "boolean"
+  ) {
+    return raw;
+  }
+
+  if (
+    typeof raw === "string"
+  ) {
+    return [
+      "1",
+      "true",
+      "yes",
+      "on"
+    ].includes(
+      raw.toLowerCase()
+    );
+  }
+
+  return DEFAULT_KV_MIRROR;
+}
+
+// ============================================================
+// LEGACY UPLOAD
+// ============================================================
+
+async function handleUpload(
+  request,
+  env,
+  url,
+  requestId
+) {
+  const contentLength =
+    Number(
+      request.headers.get(
+        "Content-Length"
+      ) || 0
+    );
+
+  // ----------------------------------------------------------
+  // HARD DEBUG
+  // ----------------------------------------------------------
+
+  if (
+    contentLength >
+      100 * 1024 * 1024 &&
+    !request.headers.get(
+      "X-Upload-Debug"
+    )
+  ) {
+    return respondUploadError(
+      "Request terlalu besar untuk upload biasa. Gunakan Chunked B2.",
+      {
+        mode:
+          "b2",
+        requestId,
+        hint:
+          "POST /api/upload/chunk/init"
+      },
+      413,
+      request
+    );
+  }
+
+  const form =
+    await request.formData();
+
+  const title =
+    clean(
+      form.get("title")
+    );
+
+  const visitorIdInput =
+    clean(
+      form.get("visitorId")
+    );
+
+  const sourceUrl =
+    clean(
+      form.get("sourceUrl")
+    );
+
+  const modeInput =
+    clean(
+      form.get("mode")
+    ).toLowerCase();
+
+  const file =
+    form.get("file");
+
+  const visitorId =
+    visitorIdInput ||
+    DEFAULT_VISITOR_ID;
+
+  let mode =
+    modeInput ||
+    (
+      sourceUrl
+        ? "proxy"
+        : "videy"
+    );
+
+  // ----------------------------------------------------------
+  // UI uses "video", server uses "videy"
+  // ----------------------------------------------------------
+
+  if (
+    mode === "video"
+  ) {
+    mode = "videy";
+  }
+
+  if (
+    ![
+      "videy",
+      "proxy",
+      "b2"
+    ].includes(mode)
+  ) {
+    mode =
+      sourceUrl
+        ? "proxy"
+        : "videy";
+  }
+
+  if (
+    mode === "proxy" &&
+    !sourceUrl
+  ) {
+    mode = "videy";
+  }
+
+  const createdAt =
+    new Date().toISOString();
+
+  if (!title) {
+    return respondUploadError(
+      "Judul wajib diisi.",
+      {
+        mode,
+        requestId
+      },
+      400,
+      request
+    );
+  }
+
+  // ----------------------------------------------------------
+  // PROXY
+  // ----------------------------------------------------------
+
+  if (
+    mode === "proxy"
+  ) {
+    if (
+      !isValidHttpUrl(
+        sourceUrl
+      )
+    ) {
+      return respondUploadError(
+        "URL sumber proxy tidak valid.",
+        {
+          mode,
+          requestId
+        },
+        400,
+        request
+      );
+    }
+
+    const baseSlug =
+      slugify(
+        title
+      );
+
+    const slugCandidate =
+      await uniqueSlug(
+        env,
+        baseSlug
+      );
+
+    const saved =
+      await saveRecord(
+        env,
+        {
+          title,
+          slug:
+            slugCandidate,
+          mode:
+            "proxy",
+          sourceUrl,
+          createdAt
+        }
+      );
+
+    const publicUrl =
+      `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+
+    const apiUrl =
+      `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    const key =
+      makeVideoKey(
+        saved.order,
+        saved.slug
+      );
+
+    const payload = {
+      title:
+        saved.title,
+
+      slug:
+        saved.slug,
+
+      order:
+        saved.order,
+
+      mode:
+        saved.mode,
+
+      createdAt:
+        saved.createdAt,
+
+      sourceUrl:
+        saved.sourceUrl
+    };
+
+    let kvMirrored =
+      false;
+
+    let kvError =
+      "";
+
+    if (
+      shouldMirrorKv(
+        env
+      ) &&
+      env?.VIDEY_KV
+    ) {
+      try {
+        await env.VIDEY_KV.put(
+          key,
+          JSON.stringify(
+            payload
+          )
+        );
+
+        kvMirrored =
+          true;
+      } catch (err) {
+        kvError =
+          err?.message ||
+          String(err);
+      }
+    }
+
+    return respondUploadSuccess(
+      {
+        publicUrl,
+        apiUrl,
+        order:
+          saved.order,
+        slug:
+          saved.slug,
+        mode,
+        title,
+        message:
+          kvMirrored
+            ? (
+                saved.storedInD1
+                  ? "Proxy link tersimpan di D1 dan KV."
+                  : "Proxy link tersimpan di KV."
+              )
+            : (
+                saved.storedInD1
+                  ? "Proxy link tersimpan di D1."
+                  : `Proxy link tersimpan di D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`
+              ),
+        storage: {
+          d1:
+            !!saved.storedInD1,
+          kv:
+            kvMirrored
+        },
+
+        requestId
+      },
+      request
+    );
+  }
+
+  // ----------------------------------------------------------
+  // B2 LEGACY
+  // ----------------------------------------------------------
+
+  if (
+    mode === "b2"
+  ) {
+    if (
+      !(file instanceof File) ||
+      file.size <= 0
+    ) {
+      return respondUploadError(
+        "File video wajib dipilih untuk mode B2.",
+        {
+          mode,
+          requestId
+        },
+        400,
+        request
+      );
+    }
+
+    // --------------------------------------------------------
+    // Force chunked for large files.
+    //
+    // Request sudah terlanjur sampai Worker, sehingga limit
+    // Cloudflare tetap berlaku. Ini terutama menangani file
+    // kecil/menengah yang masih lolos request-size limit.
+    // --------------------------------------------------------
+
+    const baseSlug =
+      slugify(
+        title
+      );
+
+    const upload =
+      await uploadToB2(
+        file,
+        baseSlug,
+        env
+      );
+
+    if (!upload.ok) {
+      return respondUploadError(
+        `Upload B2 gagal: ${upload.error}`,
+        {
+          mode,
+          raw:
+            upload.raw,
+          requestId
+        },
+        502,
+        request
+      );
+    }
+
+    const slugCandidate =
+      await uniqueSlug(
+        env,
+        baseSlug
+      );
+
+    const saved =
+      await saveRecord(
+        env,
+        {
+          title,
+          slug:
+            slugCandidate,
+          mode:
+            "b2",
+          sourceUrl:
+            upload.publicUrl,
+          b2FileName:
+            upload.fileName,
+          createdAt
+        }
+      );
+
+    const publicUrl =
+      `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+
+    const apiUrl =
+      `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    const key =
+      makeVideoKey(
+        saved.order,
+        saved.slug
+      );
+
+    const payload = {
+      title:
+        saved.title,
+
+      slug:
+        saved.slug,
+
+      order:
+        saved.order,
+
+      mode:
+        saved.mode,
+
+      createdAt:
+        saved.createdAt,
+
+      sourceUrl:
+        saved.sourceUrl,
+
+      b2FileName:
+        saved.b2FileName
+    };
+
+    let kvMirrored =
+      false;
+
+    let kvError =
+      "";
+
+    if (
+      shouldMirrorKv(
+        env
+      ) &&
+      env?.VIDEY_KV
+    ) {
+      try {
+        await env.VIDEY_KV.put(
+          key,
+          JSON.stringify(
+            payload
+          )
+        );
+
+        kvMirrored =
+          true;
+      } catch (err) {
+        kvError =
+          err?.message ||
+          String(err);
+      }
+    }
+
+    return respondUploadSuccess(
+      {
+        publicUrl,
+        apiUrl,
+        order:
+          saved.order,
+        slug:
+          saved.slug,
+        mode,
+        title,
+        message:
+          kvMirrored
+            ? (
+                saved.storedInD1
+                  ? "File B2 berhasil disimpan ke D1 dan KV."
+                  : "File B2 berhasil disimpan ke KV."
+              )
+            : (
+                saved.storedInD1
+                  ? "File B2 berhasil disimpan ke D1."
+                  : `File B2 berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`
+              ),
+        storage: {
+          d1:
+            !!saved.storedInD1,
+          kv:
+            kvMirrored
+        },
+
+        requestId
+      },
+      request
+    );
+  }
+
+  // ----------------------------------------------------------
+  // VIDEY
+  // ----------------------------------------------------------
+
+  if (
+    !(file instanceof File) ||
+    file.size <= 0
+  ) {
+    return respondUploadError(
+      "File video wajib dipilih.",
+      {
+        mode,
+        requestId
+      },
+      400,
+      request
+    );
+  }
+
+  const upload =
+    await uploadToVidey(
+      file,
+      visitorId,
+      env
+    );
+
+  if (!upload.ok) {
+    return respondUploadError(
+      "Videy tidak mengembalikan ID video yang valid.",
+      {
+        mode,
+        status:
+          upload.status,
+        contentType:
+          upload.contentType,
+        location:
+          upload.location,
+        rawJson:
+          upload.rawJson,
+        rawText:
+          upload.rawText,
+        requestId
+      },
+      502,
+      request
+    );
+  }
+
+  const baseSlug =
+    slugify(title);
+
+  const slugCandidate =
+    await uniqueSlug(
+      env,
+      baseSlug
+    );
+
+  const saved =
+    await saveRecord(
+      env,
+      {
+        title,
+        slug:
+          slugCandidate,
+        mode:
+          "videy",
+        videyId:
+          upload.videyId,
+        createdAt
+      }
+    );
+
+  const publicUrl =
+    `${url.origin}/${saved.order}/${saved.slug}.mp4`;
+
+  const apiUrl =
+    `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+  const key =
+    makeVideoKey(
+      saved.order,
+      saved.slug
+    );
+
+  const payload = {
+    title:
+      saved.title,
+
+    slug:
+      saved.slug,
+
+    order:
+      saved.order,
+
+    mode:
+      saved.mode,
+
+    createdAt:
+      saved.createdAt,
+
+    videyId:
+      saved.videyId
+  };
+
+  let kvMirrored =
+    false;
+
+  let kvError =
+    "";
+
+  if (
+    shouldMirrorKv(
+      env
+    ) &&
+    env?.VIDEY_KV
+  ) {
+    try {
+      await env.VIDEY_KV.put(
+        key,
+        JSON.stringify(
+          payload
+        )
+      );
+
+      kvMirrored =
+        true;
+    } catch (err) {
+      kvError =
+        err?.message ||
+        String(err);
+    }
+  }
+
+  return respondUploadSuccess(
+    {
+      publicUrl,
+      apiUrl,
+      order:
+        saved.order,
+      slug:
+        saved.slug,
+      mode,
+      title,
+      videyId:
+        upload.videyId,
+      message:
+        kvMirrored
+          ? (
+              saved.storedInD1
+                ? "ID asli Videy berhasil disimpan ke D1 dan KV."
+                : "ID asli Videy berhasil disimpan ke KV."
+            )
+          : (
+              saved.storedInD1
+                ? "ID asli Videy berhasil disimpan ke D1."
+                : `ID asli Videy berhasil disimpan ke D1, mirror KV gagal: ${kvError || "mirror dimatikan"}`
+            ),
+      storage: {
+        d1:
+          !!saved.storedInD1,
+        kv:
+          kvMirrored
+      },
+
+      requestId
+    },
+    request
+  );
+}
+
+// ============================================================
+// SAVE RECORD
+// ============================================================
+
+async function saveRecord(
+  env,
+  draft
+) {
+  const db =
+    getD1(env);
+
   if (!db) {
-    if (request && !wantsJson(request)) return htmlResponse("<h1>D1 Database tidak tersedia</h1>", 503);
-    return jsonResponse({ ok: false, error: "d1_not_available" }, 503);
+    const slug =
+      await uniqueSlug(
+        env,
+        draft.slug
+      );
+
+    const order =
+      await allocateOrderFromKV(
+        env
+      );
+
+    return {
+      ...draft,
+      slug,
+      order,
+      storedInD1: false
+    };
   }
-  await ensureD1Schema(env);
-  const { page, limit, offset } = parsePagination(url, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
 
-  const result = await db.prepare(`SELECT order_num AS order_num, slug, title, mode, videy_id AS videyId, source_url AS sourceUrl, b2_file_name AS b2FileName, created_at AS createdAt FROM ${D1_VIDEOS_TABLE} ORDER BY order_num ASC LIMIT ? OFFSET ?`).bind(limit + 1, offset).all();
-  const rows = result?.results || [];
-  const hasMore = rows.length > limit;
-  const items = rows.slice(0, limit).map((row) => publicRecord(normalizeRecord(row)));
+  await ensureD1Schema(
+    env
+  );
 
-  if (request && !wantsJson(request)) {
-    return renderListHtml(items, hasMore, page, limit, url, "D1");
+  await seedOrderCounter(
+    env
+  );
+
+  let order =
+    await reserveOrder(
+      env
+    );
+
+  let slug =
+    draft.slug;
+
+  for (
+    let attempt = 0;
+    attempt < 8;
+    attempt++
+  ) {
+    try {
+      await db
+        .prepare(`
+          INSERT INTO ${D1_VIDEOS_TABLE}
+          (
+            order_num,
+            slug,
+            title,
+            mode,
+            videy_id,
+            source_url,
+            b2_file_name,
+            created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .bind(
+          order,
+          slug,
+          draft.title,
+          draft.mode,
+          draft.videyId ??
+            null,
+          draft.sourceUrl ??
+            null,
+          draft.b2FileName ??
+            null,
+          draft.createdAt
+        )
+        .run();
+
+      return {
+        ...draft,
+        slug,
+        order,
+        storedInD1: true
+      };
+    } catch (err) {
+      if (
+        !isUniqueConstraintError(
+          err
+        )
+      ) {
+        throw err;
+      }
+
+      const msg =
+        String(
+          err?.message ||
+          ""
+        );
+
+      if (
+        /slug/i.test(msg)
+      ) {
+        slug =
+          `${draft.slug}-${attempt + 1}`;
+        continue;
+      }
+
+      if (
+        /order_num|PRIMARY KEY/i.test(
+          msg
+        )
+      ) {
+        order =
+          await reserveOrder(
+            env
+          );
+        continue;
+      }
+
+      throw err;
+    }
   }
 
-  return jsonResponse({ ok: true, source: "d1", page, limit, hasMore, nextPage: hasMore ? page + 1 : null, nextPageUrl: hasMore ? `${url.origin}/api/list?page=${page + 1}&limit=${limit}` : null, items });
+  throw new Error(
+    "Gagal menyimpan metadata ke D1."
+  );
 }
 
-async function handleLegacyList(env, url, request) {
-  const kv = env?.VIDEY_KV;
-  if (!kv) {
-    if (request && !wantsJson(request)) return htmlResponse("<h1>KV tidak tersedia</h1>", 503);
-    return jsonResponse({ ok: false, error: "kv_not_available" }, 503);
+// ============================================================
+// KV
+// ============================================================
+
+async function getMaxOrderFromKvUnused() {
+  return 0;
+}
+
+// ============================================================
+// VIDEY UPLOAD
+// ============================================================
+
+async function uploadToVidey(
+  file,
+  visitorId,
+  env
+) {
+  const uploadUrlInput =
+    env?.VIDEY_UPLOAD_URL ||
+    DEFAULT_UPLOAD_URL;
+
+  const uploadField =
+    env?.VIDEY_UPLOAD_FIELD ||
+    DEFAULT_UPLOAD_FIELD;
+
+  const uploadTarget =
+    new URL(
+      uploadUrlInput
+    );
+
+  if (
+    !uploadTarget.searchParams.has(
+      "visitorId"
+    )
+  ) {
+    uploadTarget.searchParams.set(
+      "visitorId",
+      visitorId
+    );
   }
 
-  const { limit, cursor } = parseKvPagination(url);
-  const listArgs = { prefix: VIDEO_PREFIX, limit: limit + 1 };
-  if (cursor) listArgs.cursor = cursor;
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0",
 
-  const result = await kv.list(listArgs);
-  const keys = result?.keys || [];
-  const hasMore = keys.length > limit;
-  const pageKeys = keys.slice(0, limit);
+    Accept:
+      "application/json"
+  };
+
+  const formData =
+    new FormData();
+
+  formData.append(
+    uploadField,
+    file,
+    file.name ||
+      "video.mp4"
+  );
+
+  const resp =
+    await fetch(
+      uploadTarget.toString(),
+      {
+        method:
+          "POST",
+
+        headers,
+
+        body:
+          formData,
+
+        redirect:
+          "follow"
+      }
+    );
+
+  const contentType =
+    resp.headers.get(
+      "content-type"
+    ) || "";
+
+  const location =
+    resp.headers.get(
+      "location"
+    ) || "";
+
+  let rawText =
+    "";
+
+  let rawJson =
+    null;
+
+  if (
+    contentType.includes(
+      "application/json"
+    )
+  ) {
+    try {
+      rawJson =
+        await resp.json();
+    } catch {
+      rawJson =
+        null;
+    }
+  } else {
+    try {
+      rawText =
+        await resp.text();
+    } catch {
+      rawText =
+        "";
+    }
+  }
+
+  const videyId =
+    extractIdFromJson(
+      rawJson
+    ) ||
+    extractIdFromText(
+      rawText
+    ) ||
+    extractIdFromText(
+      JSON.stringify(
+        rawJson ||
+        {}
+      )
+    ) ||
+    extractIdFromText(
+      location
+    ) ||
+    null;
+
+  return {
+    ok:
+      Boolean(
+        videyId
+      ),
+
+    videyId,
+
+    status:
+      resp.status,
+
+    contentType,
+
+    location,
+
+    rawJson,
+
+    rawText:
+      rawText
+        ? rawText.slice(
+            0,
+            MAX_DEBUG_TEXT
+          )
+        : ""
+  };
+}
+
+// ============================================================
+// VIDEO SERVING
+// ============================================================
+
+async function serveVideoByRoute(
+  route,
+  request,
+  env
+) {
+  const record =
+    await findRecordByRoute(
+      env,
+      route
+    );
+
+  if (!record) {
+    return textResponse(
+      "Video tidak ditemukan",
+      404
+    );
+  }
+
+  if (
+    record.mode ===
+    "proxy"
+  ) {
+    return await proxyToUpstream(
+      record.sourceUrl,
+      request,
+      record
+    );
+  }
+
+  if (
+    record.mode ===
+    "b2"
+  ) {
+    return await streamFromB2(
+      record,
+      request,
+      env
+    );
+  }
+
+  if (
+    !record.videyId
+  ) {
+    return textResponse(
+      "videyId kosong",
+      500
+    );
+  }
+
+  const upstreamUrl =
+    `${CDN_BASE}/${encodeURIComponent(record.videyId)}.mp4`;
+
+  return await proxyToUpstream(
+    upstreamUrl,
+    request,
+    record
+  );
+}
+
+async function streamFromB2(
+  record,
+  request,
+  env
+) {
+  if (
+    !record.b2FileName
+  ) {
+    return textResponse(
+      "B2 filename missing di Database",
+      500
+    );
+  }
+
+  const auth =
+    await getB2Auth(
+      env
+    );
+
+  const bucketName =
+    env?.B2_BUCKET_NAME ||
+    "videy-bucket";
+
+  const downloadUrl =
+    `${auth.downloadUrl}/file/` +
+    `${encodeURIComponent(bucketName)}/` +
+    `${encodeURIComponent(record.b2FileName)}`;
+
+  const headers =
+    new Headers();
+
+  copyHeader(
+    request.headers,
+    headers,
+    "Range"
+  );
+
+  copyHeader(
+    request.headers,
+    headers,
+    "If-Range"
+  );
+
+  copyHeader(
+    request.headers,
+    headers,
+    "Accept"
+  );
+
+  copyHeader(
+    request.headers,
+    headers,
+    "User-Agent"
+  );
+
+  copyHeader(
+    request.headers,
+    headers,
+    "Origin"
+  );
+
+  copyHeader(
+    request.headers,
+    headers,
+    "Referer"
+  );
+
+  headers.set(
+    "Authorization",
+    auth.token
+  );
+
+  const upstreamResp =
+    await fetch(
+      downloadUrl,
+      {
+        method:
+          "GET",
+
+        headers,
+
+        redirect:
+          "follow"
+      }
+    );
+
+  if (
+    !upstreamResp.ok &&
+    upstreamResp.status !==
+      206
+  ) {
+    return textResponse(
+      `B2 download failed: ${upstreamResp.status}`,
+      upstreamResp.status
+    );
+  }
+
+  const responseHeaders =
+    new Headers(
+      upstreamResp.headers
+    );
+
+  responseHeaders.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  responseHeaders.set(
+    "Cache-Control",
+    "public, max-age=3600"
+  );
+
+  responseHeaders.set(
+    "X-Video-Order",
+    String(
+      record.order ??
+      ""
+    )
+  );
+
+  responseHeaders.set(
+    "X-Video-Slug",
+    record.slug ||
+      ""
+  );
+
+  responseHeaders.set(
+    "X-Video-Title",
+    record.title ||
+      ""
+  );
+
+  if (
+    !responseHeaders.get(
+      "Accept-Ranges"
+    )
+  ) {
+    responseHeaders.set(
+      "Accept-Ranges",
+      "bytes"
+    );
+  }
+
+  return new Response(
+    upstreamResp.body,
+    {
+      status:
+        upstreamResp.status,
+
+      statusText:
+        upstreamResp.statusText,
+
+      headers:
+        responseHeaders
+    }
+  );
+}
+
+async function proxyToUpstream(
+  upstreamUrl,
+  request,
+  record
+) {
+  const upstreamHeaders =
+    new Headers();
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "Range"
+  );
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "If-Range"
+  );
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "Accept"
+  );
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "User-Agent"
+  );
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "Origin"
+  );
+
+  copyHeader(
+    request.headers,
+    upstreamHeaders,
+    "Referer"
+  );
+
+  const upstreamResp =
+    await fetch(
+      upstreamUrl,
+      {
+        method:
+          "GET",
+
+        headers:
+          upstreamHeaders,
+
+        redirect:
+          "follow"
+      }
+    );
+
+  const headers =
+    new Headers(
+      upstreamResp.headers
+    );
+
+  headers.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  headers.set(
+    "Cache-Control",
+    "public, max-age=3600"
+  );
+
+  headers.set(
+    "X-Video-Order",
+    String(
+      record.order ??
+      ""
+    )
+  );
+
+  headers.set(
+    "X-Video-Slug",
+    record.slug ||
+      ""
+  );
+
+  headers.set(
+    "X-Video-Title",
+    record.title ||
+      ""
+  );
+
+  if (
+    !headers.get(
+      "Content-Type"
+    )
+  ) {
+    headers.set(
+      "Content-Type",
+      "video/mp4"
+    );
+  }
+
+  return new Response(
+    upstreamResp.body,
+    {
+      status:
+        upstreamResp.status,
+
+      statusText:
+        upstreamResp.statusText,
+
+      headers
+    }
+  );
+}
+
+// ============================================================
+// API VIDEO
+// ============================================================
+
+async function handleApiVideo(
+  env,
+  order,
+  slug
+) {
+  const record =
+    await findRecordByRoute(
+      env,
+      {
+        order,
+        slug
+      }
+    );
+
+  if (!record) {
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          "not_found"
+      },
+      404
+    );
+  }
+
+  return jsonResponse(
+    {
+      ok: true,
+      data:
+        publicRecord(
+          record
+        )
+    }
+  );
+}
+
+// ============================================================
+// LIST
+// ============================================================
+
+async function handleList(
+  env,
+  url,
+  request
+) {
+  const db =
+    getD1(env);
+
+  if (!db) {
+    if (
+      request &&
+      !wantsJson(
+        request
+      )
+    ) {
+      return htmlResponse(
+        "<h1>D1 Database tidak tersedia</h1>",
+        503
+      );
+    }
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          "d1_not_available"
+      },
+      503
+    );
+  }
+
+  await ensureD1Schema(
+    env
+  );
+
+  const {
+    page,
+    limit,
+    offset
+  } =
+    parsePagination(
+      url,
+      DEFAULT_LIST_LIMIT,
+      MAX_LIST_LIMIT
+    );
+
+  const result =
+    await db
+      .prepare(`
+        SELECT
+          order_num AS order_num,
+          slug,
+          title,
+          mode,
+          videy_id AS videyId,
+          source_url AS sourceUrl,
+          b2_file_name AS b2FileName,
+          created_at AS createdAt
+        FROM ${D1_VIDEOS_TABLE}
+        ORDER BY order_num ASC
+        LIMIT ? OFFSET ?
+      `)
+      .bind(
+        limit + 1,
+        offset
+      )
+      .all();
+
+  const rows =
+    result?.results ||
+    [];
+
+  const hasMore =
+    rows.length >
+    limit;
+
+  const items =
+    rows
+      .slice(
+        0,
+        limit
+      )
+      .map(
+        row =>
+          publicRecord(
+            normalizeRecord(
+              row
+            )
+          )
+      );
+
+  if (
+    request &&
+    !wantsJson(
+      request
+    )
+  ) {
+    return renderListHtml(
+      items,
+      hasMore,
+      page,
+      limit,
+      url,
+      "D1"
+    );
+  }
+
+  return jsonResponse(
+    {
+      ok: true,
+      source:
+        "d1",
+
+      page,
+      limit,
+      hasMore,
+
+      nextPage:
+        hasMore
+          ? page + 1
+          : null,
+
+      nextPageUrl:
+        hasMore
+          ? `${url.origin}/api/list?page=${page + 1}&limit=${limit}`
+          : null,
+
+      items
+    }
+  );
+}
+
+// ============================================================
+// LEGACY KV LIST
+// ============================================================
+
+async function handleLegacyList(
+  env,
+  url,
+  request
+) {
+  const kv =
+    env?.VIDEY_KV;
+
+  if (!kv) {
+    if (
+      request &&
+      !wantsJson(
+        request
+      )
+    ) {
+      return htmlResponse(
+        "<h1>KV tidak tersedia</h1>",
+        503
+      );
+    }
+
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          "kv_not_available"
+      },
+      503
+    );
+  }
+
+  const {
+    limit,
+    cursor
+  } =
+    parseKvPagination(
+      url
+    );
+
+  const listArgs = {
+    prefix:
+      VIDEO_PREFIX,
+    limit:
+      limit + 1
+  };
+
+  if (cursor) {
+    listArgs.cursor =
+      cursor;
+  }
+
+  const result =
+    await kv.list(
+      listArgs
+    );
+
+  const keys =
+    result?.keys ||
+    [];
+
+  const hasMore =
+    keys.length >
+    limit;
+
+  const pageKeys =
+    keys.slice(
+      0,
+      limit
+    );
+
   const items = [];
 
-  for (const key of pageKeys) {
-    const raw = await kv.get(key.name);
+  for (
+    const key of pageKeys
+  ) {
+    const raw =
+      await kv.get(
+        key.name
+      );
+
     if (!raw) continue;
-    try { items.push(publicRecord(normalizeRecord(JSON.parse(raw)))); } catch { continue; }
-  }
 
-  items.sort((a, b) => {
-    const ao = Number(a.order || 0), bo = Number(b.order || 0);
-    if (ao !== bo) return ao - bo;
-    return String(b.createdAt).localeCompare(String(a.createdAt));
-  });
-
-  const nextCursor = hasMore ? (result?.cursor || null) : null;
-  if (request && !wantsJson(request)) {
-    return renderLegacyListHtml(items, hasMore, nextCursor, limit, url);
-  }
-
-  return jsonResponse({ ok: true, source: "kv", limit, hasMore, nextCursor, listComplete: !!result?.list_complete, items });
-}
-
-function renderListHtml(items, hasMore, page, limit, url, sourceType) {
-  const nextPageUrl = hasMore ? `${url.origin}${url.pathname}?page=${page + 1}&limit=${limit}` : null;
-  const prevPageUrl = page > 1 ? `${url.origin}${url.pathname}?page=${page - 1}&limit=${limit}` : null;
-
-  let html = `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Daftar Video (${escapeHtml(sourceType)})</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:920px;margin:40px auto;padding:0 16px;line-height:1.5}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #ddd;padding:8px;text-align:left;word-break:break-all}th{background:#f4f4f5}.pagination{margin-top:20px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}.btn{padding:10px 16px;background:#111;color:#fff;text-decoration:none;border-radius:8px;display:inline-block}.btn.disabled{background:#ccc;pointer-events:none;cursor:not-allowed}</style></head><body>
-  <h1>Daftar Video (${escapeHtml(sourceType)})</h1><p><a href="/api/upload">Upload video baru</a> | <a href="/">Beranda</a></p>
-  <table><thead><tr><th>Order</th><th>Slug</th><th>Title</th><th>Mode</th><th>Stream URL</th></tr></thead><tbody>`;
-
-  for (const item of items) {
-    const pubUrl = `${url.origin}/${item.order}/${item.slug}.mp4`;
-    html += `<tr><td>${escapeHtml(item.order)}</td><td>${escapeHtml(item.slug)}</td><td>${escapeHtml(item.title)}</td><td>${escapeHtml(item.mode)}</td><td><a href="${escapeHtml(pubUrl)}" target="_blank">Buka</a></td></tr>`;
-  }
-
-  html += `</tbody></table><div class="pagination">
-    <a href="${prevPageUrl || '#'}" class="btn ${!prevPageUrl ? 'disabled' : ''}">← Halaman Sebelumnya</a>
-    <a href="${nextPageUrl || '#'}" class="btn ${!hasMore ? 'disabled' : ''}">Halaman Berikutnya →</a></div></body></html>`;
-  return htmlResponse(html);
-}
-
-function renderLegacyListHtml(items, hasMore, nextCursor, limit, url) {
-  const nextUrl = hasMore && nextCursor ? `${url.origin}${url.pathname}?limit=${limit}&cursor=${encodeURIComponent(nextCursor)}` : null;
-
-  let html = `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Daftar Video (KV Legacy)</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:920px;margin:40px auto;padding:0 16px;line-height:1.5}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #ddd;padding:8px;text-align:left;word-break:break-all}th{background:#f4f4f5}.pagination{margin-top:20px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}.btn{padding:10px 16px;background:#111;color:#fff;text-decoration:none;border-radius:8px;display:inline-block}.btn.disabled{background:#ccc;pointer-events:none;cursor:not-allowed}</style></head><body>
-  <h1>Daftar Video (KV Legacy)</h1><p><a href="/api/upload">Upload video baru</a> | <a href="/">Beranda</a></p>
-  <table><thead><tr><th>Order</th><th>Slug</th><th>Title</th><th>Mode</th><th>Stream URL</th></tr></thead><tbody>`;
-
-  for (const item of items) {
-    const pubUrl = `${url.origin}/${item.order}/${item.slug}.mp4`;
-    html += `<tr><td>${escapeHtml(item.order)}</td><td>${escapeHtml(item.slug)}</td><td>${escapeHtml(item.title)}</td><td>${escapeHtml(item.mode)}</td><td><a href="${escapeHtml(pubUrl)}" target="_blank">Buka</a></td></tr>`;
-  }
-
-  html += `</tbody></table><div class="pagination">
-    <a href="${nextUrl || '#'}" class="btn ${!nextUrl ? 'disabled' : ''}">Halaman Berikutnya →</a></div></body></html>`;
-  return htmlResponse(html);
-}
-
-async function findRecordByRoute(env, route) {
-  const db = getD1(env);
-  if (db) {
-    await ensureD1Schema(env);
-    if (route.order && route.slug) {
-      const row = await db.prepare(`SELECT order_num AS order_num, slug, title, mode, videy_id AS videyId, source_url AS sourceUrl, b2_file_name AS b2FileName, created_at AS createdAt FROM ${D1_VIDEOS_TABLE} WHERE order_num = ? AND slug = ? LIMIT 1`).bind(Number(route.order), route.slug).first();
-      if (row) return normalizeRecord(row);
-    }
-    if (route.slug) {
-      const row = await db.prepare(`SELECT order_num AS order_num, slug, title, mode, videy_id AS videyId, source_url AS sourceUrl, b2_file_name AS b2FileName, created_at AS createdAt FROM ${D1_VIDEOS_TABLE} WHERE slug = ? ORDER BY order_num DESC LIMIT 1`).bind(route.slug).first();
-      if (row) return normalizeRecord(row);
-    }
-  }
-
-  const kv = env?.VIDEY_KV;
-  if (!kv) return null;
-  const result = await kv.list({ prefix: VIDEO_PREFIX, limit: 1000 });
-  for (const key of result.keys) {
-    const raw = await kv.get(key.name);
-    if (!raw) continue;
     try {
-      const record = JSON.parse(raw);
-      if (route.order && route.slug) {
-        if (String(record.order) === String(route.order) && record.slug === route.slug) return normalizeRecord(record);
-      } else if (route.slug) {
-        if (record.slug === route.slug) return normalizeRecord(record);
-      }
-    } catch { continue; }
+      items.push(
+        publicRecord(
+          normalizeRecord(
+            JSON.parse(
+              raw
+            )
+          )
+        )
+      );
+    } catch {
+      continue;
+    }
   }
+
+  items.sort(
+    (a, b) => {
+      const ao =
+        Number(
+          a.order ||
+          0
+        );
+
+      const bo =
+        Number(
+          b.order ||
+          0
+        );
+
+      if (
+        ao !== bo
+      ) {
+        return ao - bo;
+      }
+
+      return String(
+        b.createdAt
+      ).localeCompare(
+        String(
+          a.createdAt
+        )
+      );
+    }
+  );
+
+  const nextCursor =
+    hasMore
+      ? (
+          result?.cursor ||
+          null
+        )
+      : null;
+
+  if (
+    request &&
+    !wantsJson(
+      request
+    )
+  ) {
+    return renderLegacyListHtml(
+      items,
+      hasMore,
+      nextCursor,
+      limit,
+      url
+    );
+  }
+
+  return jsonResponse(
+    {
+      ok: true,
+      source:
+        "kv",
+      limit,
+      hasMore,
+      nextCursor,
+      listComplete:
+        !!result?.list_complete,
+      items
+    }
+  );
+}
+
+// ============================================================
+// FIND RECORD
+// ============================================================
+
+async function findRecordByRoute(
+  env,
+  route
+) {
+  const db =
+    getD1(env);
+
+  if (db) {
+    await ensureD1Schema(
+      env
+    );
+
+    if (
+      route.order &&
+      route.slug
+    ) {
+      const row =
+        await db
+          .prepare(`
+            SELECT
+              order_num AS order_num,
+              slug,
+              title,
+              mode,
+              videy_id AS videyId,
+              source_url AS sourceUrl,
+              b2_file_name AS b2FileName,
+              created_at AS createdAt
+            FROM ${D1_VIDEOS_TABLE}
+            WHERE order_num = ?
+              AND slug = ?
+            LIMIT 1
+          `)
+          .bind(
+            Number(
+              route.order
+            ),
+            route.slug
+          )
+          .first();
+
+      if (row) {
+        return normalizeRecord(
+          row
+        );
+      }
+    }
+
+    if (
+      route.slug
+    ) {
+      const row =
+        await db
+          .prepare(`
+            SELECT
+              order_num AS order_num,
+              slug,
+              title,
+              mode,
+              videy_id AS videyId,
+              source_url AS sourceUrl,
+              b2_file_name AS b2FileName,
+              created_at AS createdAt
+            FROM ${D1_VIDEOS_TABLE}
+            WHERE slug = ?
+            ORDER BY order_num DESC
+            LIMIT 1
+          `)
+          .bind(
+            route.slug
+          )
+          .first();
+
+      if (row) {
+        return normalizeRecord(
+          row
+        );
+      }
+    }
+  }
+
+  const kv =
+    env?.VIDEY_KV;
+
+  if (!kv) {
+    return null;
+  }
+
+  const result =
+    await kv.list(
+      {
+        prefix:
+          VIDEO_PREFIX,
+        limit:
+          1000
+      }
+    );
+
+  for (
+    const key of result.keys
+  ) {
+    const raw =
+      await kv.get(
+        key.name
+      );
+
+    if (!raw) continue;
+
+    try {
+      const record =
+        JSON.parse(
+          raw
+        );
+
+      if (
+        route.order &&
+        route.slug
+      ) {
+        if (
+          String(
+            record.order
+          ) ===
+            String(
+              route.order
+            ) &&
+          record.slug ===
+            route.slug
+        ) {
+          return normalizeRecord(
+            record
+          );
+        }
+      } else if (
+        route.slug
+      ) {
+        if (
+          record.slug ===
+          route.slug
+        ) {
+          return normalizeRecord(
+            record
+          );
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
   return null;
 }
 
-async function uniqueSlug(env, base) {
-  const root = base || `video-${Date.now()}`;
-  let slug = root, i = 0;
-  while (await slugExists(env, slug)) { i += 1; slug = `${root}-${i}`; }
+// ============================================================
+// SLUG
+// ============================================================
+
+async function uniqueSlug(
+  env,
+  base
+) {
+  const root =
+    base ||
+    `video-${Date.now()}`;
+
+  let slug =
+    root;
+
+  let i = 0;
+
+  while (
+    await slugExists(
+      env,
+      slug
+    )
+  ) {
+    i += 1;
+
+    slug =
+      `${root}-${i}`;
+  }
+
   return slug;
 }
 
-async function slugExists(env, slug) {
-  const db = getD1(env);
+async function slugExists(
+  env,
+  slug
+) {
+  const db =
+    getD1(env);
+
   if (db) {
-    await ensureD1Schema(env);
-    const row = await db.prepare(`SELECT 1 AS found FROM ${D1_VIDEOS_TABLE} WHERE slug = ? LIMIT 1`).bind(slug).first();
-    if (row) return true;
+    await ensureD1Schema(
+      env
+    );
+
+    const row =
+      await db
+        .prepare(`
+          SELECT 1 AS found
+          FROM ${D1_VIDEOS_TABLE}
+          WHERE slug = ?
+          LIMIT 1
+        `)
+        .bind(
+          slug
+        )
+        .first();
+
+    if (row) {
+      return true;
+    }
   }
-  const kv = env?.VIDEY_KV;
-  if (!kv) return false;
-  const result = await kv.list({ prefix: VIDEO_PREFIX, limit: 1000 });
-  for (const key of result.keys) {
-    const raw = await kv.get(key.name);
+
+  const kv =
+    env?.VIDEY_KV;
+
+  if (!kv) {
+    return false;
+  }
+
+  const result =
+    await kv.list(
+      {
+        prefix:
+          VIDEO_PREFIX,
+        limit:
+          1000
+      }
+    );
+
+  for (
+    const key of result.keys
+  ) {
+    const raw =
+      await kv.get(
+        key.name
+      );
+
     if (!raw) continue;
-    try { if (JSON.parse(raw).slug === slug) return true; } catch { continue; }
+
+    try {
+      if (
+        JSON.parse(
+          raw
+        ).slug ===
+        slug
+      ) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
   }
+
   return false;
 }
 
-function makeVideoKey(order, slug) { return `${VIDEO_PREFIX}${String(order)}:${String(slug)}`; }
+// ============================================================
+// ROUTES
+// ============================================================
 
-function parsePublicRoute(pathname) {
-  const m1 = pathname.match(/^\/(\d+)\/([^/]+)\.mp4$/i);
-  if (m1) return { order: m1[1], slug: decodeURIComponentSafe(m1[2]) };
-  const m2 = pathname.match(/^\/([^/]+)\.mp4$/i);
-  if (m2) return { order: null, slug: decodeURIComponentSafe(m2[1]) };
+function makeVideoKey(
+  order,
+  slug
+) {
+  return `${VIDEO_PREFIX}${String(order)}:${String(slug)}`;
+}
+
+function parsePublicRoute(
+  pathname
+) {
+  const m1 =
+    pathname.match(
+      /^\/(\d+)\/([^/]+)\.mp4$/i
+    );
+
+  if (m1) {
+    return {
+      order:
+        m1[1],
+      slug:
+        decodeURIComponentSafe(
+          m1[2]
+        )
+    };
+  }
+
+  const m2 =
+    pathname.match(
+      /^\/([^/]+)\.mp4$/i
+    );
+
+  if (m2) {
+    return {
+      order:
+        null,
+
+      slug:
+        decodeURIComponentSafe(
+          m2[1]
+        )
+    };
+  }
+
   return null;
 }
 
-function parseApiVideoPath(pathname) {
-  const rest = pathname.slice("/api/video/".length);
-  const m = rest.match(/^(\d+)\/([^/]+)(?:\.mp4)?$/i);
-  if (m) return { order: m[1], slug: decodeURIComponentSafe(m[2]) };
-  return { order: null, slug: decodeURIComponentSafe(rest.replace(/\.mp4$/i, "")) };
+function parseApiVideoPath(
+  pathname
+) {
+  const rest =
+    pathname.slice(
+      "/api/video/".length
+    );
+
+  const m =
+    rest.match(
+      /^(\d+)\/([^/]+)(?:\.mp4)?$/i
+    );
+
+  if (m) {
+    return {
+      order:
+        m[1],
+
+      slug:
+        decodeURIComponentSafe(
+          m[2]
+        )
+    };
+  }
+
+  return {
+    order:
+      null,
+
+    slug:
+      decodeURIComponentSafe(
+        rest.replace(
+          /\.mp4$/i,
+          ""
+        )
+      )
+  };
 }
 
-function decodeURIComponentSafe(value) { try { return decodeURIComponent(value); } catch { return value; } }
-function isValidHttpUrl(value) { try { const u = new URL(value); return u.protocol === "http:" || u.protocol === "https:"; } catch { return false; } }
-function slugify(input) { return String(input || "").toLowerCase().trim().replace(/['"]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || `video-${Date.now()}`; }
-function clean(v) { return String(v ?? "").trim(); }
-function publicRecord(record) {
-  const n = normalizeRecord(record);
-  if (!n || typeof n !== "object") return record;
-  const out = { title: n.title, slug: n.slug, order: n.order, mode: n.mode, createdAt: n.createdAt };
-  if (n.mode === "videy" && n.videyId) out.videyId = n.videyId;
+// ============================================================
+// NORMALIZERS
+// ============================================================
+
+function decodeURIComponentSafe(
+  value
+) {
+  try {
+    return decodeURIComponent(
+      value
+    );
+  } catch {
+    return value;
+  }
+}
+
+function isValidHttpUrl(
+  value
+) {
+  try {
+    const u =
+      new URL(
+        value
+      );
+
+    return (
+      u.protocol ===
+        "http:" ||
+      u.protocol ===
+        "https:"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function slugify(
+  input
+) {
+  return String(
+    input ||
+      ""
+  )
+    .toLowerCase()
+    .trim()
+    .replace(
+      /['"]/g,
+      ""
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      "-"
+    )
+    .replace(
+      /^-+|-+$/g,
+      ""
+    )
+    .slice(
+      0,
+      80
+    ) ||
+    `video-${Date.now()}`;
+}
+
+function clean(
+  v
+) {
+  return String(
+    v ??
+      ""
+  ).trim();
+}
+
+function normalizeRecord(
+  record
+) {
+  if (
+    !record ||
+    typeof record !==
+      "object"
+  ) {
+    return record;
+  }
+
+  const order =
+    Number(
+      record.order ??
+      record.order_num ??
+      record.orderNum ??
+      0
+    ) || null;
+
+  return {
+    title:
+      record.title ??
+      "",
+
+    slug:
+      record.slug ??
+      "",
+
+    order,
+
+    mode:
+      record.mode ??
+      "",
+
+    createdAt:
+      record.createdAt ??
+      record.created_at ??
+      "",
+
+    videyId:
+      record.videyId ??
+      record.videy_id ??
+      null,
+
+    sourceUrl:
+      record.sourceUrl ??
+      record.source_url ??
+      null,
+
+    b2FileName:
+      record.b2FileName ??
+      record.b2_file_name ??
+      null
+  };
+}
+
+function publicRecord(
+  record
+) {
+  const n =
+    normalizeRecord(
+      record
+    );
+
+  if (
+    !n ||
+    typeof n !==
+      "object"
+  ) {
+    return record;
+  }
+
+  const out = {
+    title:
+      n.title,
+
+    slug:
+      n.slug,
+
+    order:
+      n.order,
+
+    mode:
+      n.mode,
+
+    createdAt:
+      n.createdAt
+  };
+
+  if (
+    n.mode ===
+      "videy" &&
+    n.videyId
+  ) {
+    out.videyId =
+      n.videyId;
+  }
+
   return out;
 }
 
-function extractIdFromJson(data) {
-  if (!data || typeof data !== "object") return null;
-  const candidates = [data.id, data.videoId, data.fileId, data.videyId, data.data?.id, data.data?.videoId, data.data?.fileId, data.data?.videyId, data.result?.id, data.result?.videoId, data.result?.fileId, data.result?.videyId, data.response?.id, data.response?.videoId, data.response?.fileId, data.response?.videyId];
-  for (const c of candidates) { if (typeof c === "string" && c.trim()) return c.trim(); }
+// ============================================================
+// ID EXTRACT
+// ============================================================
+
+function extractIdFromJson(
+  data
+) {
+  if (
+    !data ||
+    typeof data !==
+      "object"
+  ) {
+    return null;
+  }
+
+  const candidates = [
+    data.id,
+    data.videoId,
+    data.fileId,
+    data.videyId,
+
+    data.data?.id,
+    data.data?.videoId,
+    data.data?.fileId,
+    data.data?.videyId,
+
+    data.result?.id,
+    data.result?.videoId,
+    data.result?.fileId,
+    data.result?.videyId,
+
+    data.response?.id,
+    data.response?.videoId,
+    data.response?.fileId,
+    data.response?.videyId
+  ];
+
+  for (
+    const c of candidates
+  ) {
+    if (
+      typeof c ===
+        "string" &&
+      c.trim()
+    ) {
+      return c.trim();
+    }
+  }
+
   return null;
 }
 
-function extractIdFromText(text) {
-  if (!text) return null;
-  const s = String(text);
-  const patterns = [/"id"\s*:\s*"([^"]+)"/i, /'id'\s*:\s*'([^']+)'/i, /"videoId"\s*:\s*"([^"]+)"/i, /'videoId'\s*:\s*'([^']+)'/i, /"fileId"\s*:\s*"([^"]+)"/i, /'fileId'\s*:\s*'([^']+)'/i, /"videyId"\s*:\s*"([^"]+)"/i, /'videyId'\s*:\s*'([^']+)'/i, /([A-Za-z0-9_-]{5,})/i];
-  for (const re of patterns) { const m = s.match(re); if (m?.[1]) return m[1]; }
+function extractIdFromText(
+  text
+) {
+  if (!text) {
+    return null;
+  }
+
+  const s =
+    String(
+      text
+    );
+
+  const patterns = [
+    /"id"\s*:\s*"([^"]+)"/i,
+    /'id'\s*:\s*'([^']+)'/i,
+
+    /"videoId"\s*:\s*"([^"]+)"/i,
+    /'videoId'\s*:\s*'([^']+)'/i,
+
+    /"fileId"\s*:\s*"([^"]+)"/i,
+    /'fileId'\s*:\s*'([^']+)'/i,
+
+    /"videyId"\s*:\s*"([^"]+)"/i,
+    /'videyId'\s*:\s*'([^']+)'/i,
+
+    /([A-Za-z0-9_-]{5,})/i
+  ];
+
+  for (
+    const re of patterns
+  ) {
+    const m =
+      s.match(
+        re
+      );
+
+    if (
+      m?.[1]
+    ) {
+      return m[1];
+    }
+  }
+
   return null;
 }
 
-function copyHeader(src, dst, name) { const val = src.get(name); if (val) dst.set(name, val); }
+// ============================================================
+// HEADERS
+// ============================================================
 
-function wantsJson(request) {
-  const accept = request.headers.get("accept") || "";
-  const xrw = request.headers.get("x-requested-with") || "";
-  return accept.includes("application/json") || xrw.toLowerCase() === "xmlhttprequest";
+function copyHeader(
+  src,
+  dst,
+  name
+) {
+  const val =
+    src.get(
+      name
+    );
+
+  if (val) {
+    dst.set(
+      name,
+      val
+    );
+  }
 }
 
-function respondUploadSuccess(payload, request) {
-  if (wantsJson(request)) return jsonResponse({ ok: true, ...payload }, 200);
-  return htmlResponse(renderResultBlock(payload));
+function wantsJson(
+  request
+) {
+  const accept =
+    request.headers.get(
+      "accept"
+    ) || "";
+
+  const xrw =
+    request.headers.get(
+      "x-requested-with"
+    ) || "";
+
+  return (
+    accept.includes(
+      "application/json"
+    ) ||
+    xrw.toLowerCase() ===
+      "xmlhttprequest"
+  );
 }
 
-function respondUploadError(message, data, status, request) {
-  if (wantsJson(request)) return jsonResponse({ ok: false, error: message, data }, status);
-  return htmlResponse(renderResultBlock({ title: "Upload gagal", message, data, color: "red" }), status);
+// ============================================================
+// INTEGER PARSING
+// ============================================================
+
+function parsePositiveInt(
+  value,
+  fallback
+) {
+  const n =
+    Number.parseInt(
+      String(
+        value ??
+          ""
+      ),
+      10
+    );
+
+  return Number.isFinite(
+    n
+  ) &&
+    n > 0
+    ? n
+    : fallback;
 }
 
-function htmlResponse(html, status = 200) { return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }); }
-function jsonResponse(obj, status = 200) { return new Response(JSON.stringify(obj, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
-function textResponse(text, status = 200) { return new Response(text, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } }); }
+function clampInt(
+  value,
+  fallback,
+  min,
+  max
+) {
+  const n =
+    parsePositiveInt(
+      value,
+      fallback
+    );
 
-function escapeHtml(value) { return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
-
-function renderHome(url) {
-  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MyBlobVidey</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:920px;margin:40px auto;padding:0 16px;line-height:1.5}.box{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}a{color:#2563eb;text-decoration:none}code{background:#f4f4f5;padding:2px 6px;border-radius:6px}ul{margin:8px 0 0 18px}</style></head><body>
-  <h1>MyBlobVidey</h1><div class="box"><p>Polos, minimalis, dan tetap lincah.</p><p><a href="/api/upload">Buka uploader</a> | <a href="/api/list">Lihat Daftar Video (UI & API)</a> | <a href="/api/list/legacy">Lihat list KV legacy</a></p></div>
-  <div class="box"><strong>Format URL publik</strong><ul><li><code>${escapeHtml(url.origin)}/1/judul-video.mp4</code></li><li><code>${escapeHtml(url.origin)}/judul-video.mp4</code></li></ul></div></body></html>`;
+  return Math.min(
+    max,
+    Math.max(
+      min,
+      n
+    )
+  );
 }
+
+function parsePagination(
+  url,
+  defaultLimit,
+  maxLimit
+) {
+  const page =
+    clampInt(
+      url.searchParams.get(
+        "page"
+      ),
+      1,
+      1,
+      1000000
+    );
+
+  const limit =
+    clampInt(
+      url.searchParams.get(
+        "limit"
+      ),
+      defaultLimit,
+      1,
+      maxLimit
+    );
+
+  return {
+    page,
+    limit,
+    offset:
+      (page - 1) *
+      limit
+  };
+}
+
+function parseKvPagination(
+  url
+) {
+  const limit =
+    clampInt(
+      url.searchParams.get(
+        "limit"
+      ),
+      DEFAULT_LEGACY_LIMIT,
+      1,
+      MAX_LEGACY_LIMIT
+    );
+
+  const cursor =
+    clean(
+      url.searchParams.get(
+        "cursor"
+      )
+    );
+
+  return {
+    limit,
+    cursor:
+      cursor ||
+      null
+  };
+}
+
+// ============================================================
+// ERRORS / RESPONSE
+// ============================================================
+
+function isUniqueConstraintError(
+  err
+) {
+  const msg =
+    String(
+      err?.message ||
+      err ||
+      ""
+    );
+
+  return /UNIQUE constraint failed|constraint failed|PRIMARY KEY constraint failed/i.test(
+    msg
+  );
+}
+
+function respondUploadSuccess(
+  payload,
+  request
+) {
+  if (
+    wantsJson(
+      request
+    )
+  ) {
+    return jsonResponse(
+      {
+        ok: true,
+        ...payload
+      },
+      200
+    );
+  }
+
+  return htmlResponse(
+    renderResultBlock(
+      payload
+    )
+  );
+}
+
+function respondUploadError(
+  message,
+  data,
+  status,
+  request
+) {
+  if (
+    wantsJson(
+      request
+    )
+  ) {
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          message,
+        data
+      },
+      status
+    );
+  }
+
+  return htmlResponse(
+    renderResultBlock(
+      {
+        title:
+          "Upload gagal",
+
+        message,
+
+        data,
+
+        color:
+          "red"
+      }
+    ),
+    status
+  );
+}
+
+function jsonResponse(
+  obj,
+  status = 200,
+  extraHeaders = {}
+) {
+  return new Response(
+    JSON.stringify(
+      obj,
+      null,
+      2
+    ),
+    {
+      status,
+
+      headers: {
+        "content-type":
+          "application/json; charset=utf-8",
+
+        "cache-control":
+          "no-store",
+
+        ...extraHeaders
+      }
+    }
+  );
+}
+
+function htmlResponse(
+  html,
+  status = 200,
+  extraHeaders = {}
+) {
+  return new Response(
+    html,
+    {
+      status,
+
+      headers: {
+        "content-type":
+          "text/html; charset=utf-8",
+
+        "cache-control":
+          "no-store",
+
+        ...extraHeaders
+      }
+    }
+  );
+}
+
+function textResponse(
+  text,
+  status = 200,
+  extraHeaders = {}
+) {
+  return new Response(
+    text,
+    {
+      status,
+
+      headers: {
+        "content-type":
+          "text/plain; charset=utf-8",
+
+        "cache-control":
+          "no-store",
+
+        ...extraHeaders
+      }
+    }
+  );
+}
+
+// ============================================================
+// HTML HOME
+// ============================================================
+
+function renderHome(
+  url
+) {
+  return `<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MyBlobVidey</title>
+
+<style>
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-width:920px;
+  margin:40px auto;
+  padding:0 16px;
+  line-height:1.5
+}
+
+.box{
+  border:1px solid #ddd;
+  border-radius:12px;
+  padding:16px;
+  margin:12px 0
+}
+
+a{
+  color:#2563eb;
+  text-decoration:none
+}
+
+code{
+  background:#f4f4f5;
+  padding:2px 6px;
+  border-radius:6px
+}
+
+ul{
+  margin:8px 0 0 18px
+}
+
+.debug{
+  margin-top:16px;
+  padding:12px;
+  border-radius:12px;
+  background:#f7f7f7;
+  border:1px solid #ddd
+}
+</style>
+</head>
+
+<body>
+
+<h1>MyBlobVidey</h1>
+
+<div class="box">
+  <p>Polos, minimalis, dan tetap lincah.</p>
+
+  <p>
+    <a href="/api/upload">
+      Buka uploader
+    </a>
+    |
+    <a href="/api/list">
+      Lihat Daftar Video
+    </a>
+    |
+    <a href="/api/list/legacy">
+      KV Legacy
+    </a>
+  </p>
+</div>
+
+<div class="box">
+
+<strong>Format URL publik</strong>
+
+<ul>
+  <li>
+    <code>
+      ${escapeHtml(
+        url.origin
+      )}/1/judul-video.mp4
+    </code>
+  </li>
+
+  <li>
+    <code>
+      ${escapeHtml(
+        url.origin
+      )}/judul-video.mp4
+    </code>
+  </li>
+</ul>
+
+</div>
+
+<div class="debug">
+<strong>Chunk B2</strong>
+<p>
+File B2 besar akan memakai Large File API,
+50 MiB per chunk secara default.
+</p>
+</div>
+
+</body>
+</html>`;
+}
+
+// ============================================================
+// HTML UPLOADER
+// ============================================================
 
 function renderUploadPage() {
-  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Upload</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.5}.box{border:1px solid #ddd;border-radius:12px;padding:16px}label{display:block;margin:12px 0 6px}input,button{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:10px;font:inherit}button{cursor:pointer;background:#111;color:#fff;border:none;margin-top:14px}button:disabled{opacity:.7;cursor:not-allowed}small{color:#666}progress{width:100%;height:16px}pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:12px;border-radius:12px;overflow:auto}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#666;font-size:.95rem}.hidden{display:none}.radioRow{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 4px}.radioRow label{display:flex;gap:6px;align-items:center;margin:0}.block{border:1px solid #ddd;border-radius:12px;padding:14px;margin-top:16px}.blockTitle{font-weight:700;margin-bottom:8px}.urlRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:10px}.urlRow input{width:100%}.copyBtn{width:auto;min-width:86px;padding:10px 12px;background:#f3f4f6;color:#111;border:1px solid #ccc}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.secondary{display:inline-block;padding:10px 12px;border:1px solid #ccc;border-radius:10px;color:#111;text-decoration:none;background:#f9f9f9}.hint{margin-top:8px;color:#666;font-size:.95rem}.status{margin-top:12px;font-weight:600}</style></head><body>
-  <h1>Uploader</h1><div class="box"><form id="uploadForm" method="POST" enctype="multipart/form-data"><label>Judul</label><input name="title" required placeholder="contoh: kucing-lucu">
-  <div class="radioRow" aria-label="Mode upload"><label><input type="radio" name="mode" value="video" checked> Upload video (Videy)</label><label><input type="radio" name="mode" value="b2"> Upload video (B2)</label><label><input type="radio" name="mode" value="proxy"> Upload link (Proxy)</label></div>
-  <div id="videoFields"><label>File video</label><input type="file" name="file" accept="video/*"></div><div id="proxyFields" class="hidden"><label>Link video sumber</label><input name="sourceUrl" placeholder="https://example.com/video.mp4"></div>
-  <label>visitorId (opsional - khusus Videy)</label><input name="visitorId" placeholder="1f5f718b-06b2-40f9-82da-0a73dfdadd1c"><button id="submitBtn" type="submit">Upload</button>
-  <div class="hint">Mode Videy akan upload ke Videy. Mode B2 akan upload ke Backblaze B2 (butuh env B2_KEY_ID, B2_APP_KEY, B2_BUCKET_NAME). Mode link akan disimpan sebagai proxy tanpa upload file.</div></form>
-  <div style="margin-top:14px"><progress id="progressBar" value="0" max="100" hidden></progress><div class="status" id="statusText">Siap</div></div><div id="resultWrap" class="block hidden"></div></div>
-  <p><small>Semua tetap polos, ringan, dan ramah mata.</small></p>
-  <script>const form=document.getElementById("uploadForm"),submitBtn=document.getElementById("submitBtn"),progressBar=document.getElementById("progressBar"),statusText=document.getElementById("statusText"),resultWrap=document.getElementById("resultWrap"),videoFields=document.getElementById("videoFields"),proxyFields=document.getElementById("proxyFields"),modeRadios=[...form.querySelectorAll('input[name="mode"]')];function esc(s){return String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}function currentMode(){const c=form.querySelector('input[name="mode"]:checked');return c?c.value:"video"}function toggleMode(){const m=currentMode();if(m==="proxy"){proxyFields.classList.remove("hidden");videoFields.classList.add("hidden")}else{proxyFields.classList.add("hidden");videoFields.classList.remove("hidden")}}function setStatus(t){statusText.textContent=t}function setLoading(on){submitBtn.disabled=on;if(on){progressBar.hidden=false;progressBar.value=8}else{progressBar.hidden=true;progressBar.value=0}}function renderResult(data){const ok=!!data.ok,title=ok?(data.mode==="proxy"?"Successfully saved proxy":"Successfully uploaded"):"Upload gagal",color=ok?"green":"red",publicUrl=data.publicUrl||"",apiUrl=data.apiUrl||"",order=data.order??"",slug=data.slug||"",mode=data.mode||"",message=data.message||(ok?"Selesai.":data.error||"Terjadi kesalahan.");resultWrap.classList.remove("hidden");resultWrap.innerHTML=\`<div class="blockTitle" style="color:\${color}">\${esc(title)}</div><div class="muted">\${esc(message)}</div><div class="row" style="margin-top:10px"><div><strong>Order</strong><br>\${esc(order)}</div><div><strong>Mode</strong><br>\${esc(mode)}</div></div><div style="margin-top:10px"><strong>Slug</strong><br>\${esc(slug)}</div><div style="margin-top:12px"><strong>URL hasil</strong><div class="urlRow"><input readonly value="\${esc(publicUrl)}" id="publicUrlInput"><button type="button" class="copyBtn" data-copy="\${esc(publicUrl)}">Copy</button></div></div><div style="margin-top:12px"><strong>API</strong><div class="urlRow"><input readonly value="\${esc(apiUrl)}" id="apiUrlInput"><button type="button" class="copyBtn" data-copy="\${esc(apiUrl)}">Copy</button></div></div><div class="actions"><a class="secondary" href="/api/upload">Upload lagi?</a><button type="button" class="secondary" id="resetBtn">Bersihkan</button></div><details style="margin-top:12px"><summary>Lihat data</summary><pre>\${esc(JSON.stringify(data,null,2))}</pre></details>\`;resultWrap.querySelectorAll("[data-copy]").forEach(b=>{b.addEventListener("click",async()=>{const t=b.getAttribute("data-copy")||"";try{await navigator.clipboard.writeText(t);const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1e3)}catch(e){const o=b.textContent;b.textContent="Gagal";setTimeout(()=>b.textContent=o,1e3)}})});const r=resultWrap.querySelector("#resetBtn");if(r)r.addEventListener("click",()=>{form.reset();toggleMode();resultWrap.classList.add("hidden");resultWrap.innerHTML="";setStatus("Siap");window.scrollTo({top:0,behavior:"smooth"})})}modeRadios.forEach(r=>r.addEventListener("change",toggleMode));toggleMode();form.addEventListener("submit",function(e){e.preventDefault();resultWrap.classList.add("hidden");resultWrap.innerHTML="";const m=currentMode(),fd=new FormData(form);if(m==="proxy")fd.delete("file");else fd.delete("sourceUrl");const xhr=new XMLHttpRequest;xhr.open("POST","/api/upload",true);xhr.setRequestHeader("Accept","application/json");xhr.responseType="text";xhr.upload.onprogress=function(ev){if(m==="video"||m==="b2"){progressBar.hidden=false;if(ev.lengthComputable){progressBar.value=Math.round(ev.loaded/ev.total*100);setStatus("Mengirim... "+progressBar.value+"%")}else{progressBar.removeAttribute("value");setStatus("Mengirim...")}}else{progressBar.hidden=false;progressBar.value=45;setStatus("Menyimpan link...")}};xhr.onreadystatechange=function(){if(xhr.readyState===2)setStatus("Memproses respons...");if(xhr.readyState===4){setLoading(false);let p=xhr.responseText;try{p=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300)setStatus("Selesai");else setStatus("Gagal");renderResult(p)}};xhr.onerror=function(){setLoading(false);setStatus("Gagal jaringan");resultWrap.classList.remove("hidden");resultWrap.innerHTML=\`<div class="blockTitle" style="color:red">Upload gagal</div><div class="muted">Terjadi error jaringan.</div>\`};setLoading(true);setStatus(m==="proxy"?"Menyimpan link...":"Menyiapkan upload...");xhr.send(fd);let f=m==="proxy"?15:8;const t=setInterval(()=>{if(!submitBtn.disabled){clearInterval(t);return}if(!progressBar.hidden){f=Math.min(f+3,95);if(progressBar.hasAttribute("value"))progressBar.value=f}},180)})</script></body></html>`;
+  return `<!doctype html>
+<html lang="id">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>Upload</title>
+
+<style>
+
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-width:760px;
+  margin:40px auto;
+  padding:0 16px;
+  line-height:1.5
 }
 
-function renderResultBlock({ title, message, data = null, color = "black" }) {
-  const payload = data ? JSON.stringify(data, null, 2) : "";
-  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title>
-  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.5}.block{border:1px solid #ddd;border-radius:12px;padding:16px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.title{font-weight:700}.muted{color:#666}.row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:10px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:10px;font:inherit}button,a.btn{padding:10px 12px;border:1px solid #ccc;border-radius:10px;background:#f9f9f9;color:#111;text-decoration:none;display:inline-block;cursor:pointer}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:12px;border-radius:12px;overflow:auto;margin-top:12px}details{margin-top:12px}</style></head><body>
-  <div class="block"><div class="top"><div class="title" style="color:${color}">${escapeHtml(title)}</div><div>${escapeHtml(message)}</div></div>
-  ${data ? `<div style="margin-top:10px"><strong>Order</strong><br>${escapeHtml(data.order ?? "")}</div><div style="margin-top:10px"><strong>Mode</strong><br>${escapeHtml(data.mode ?? "")}</div><div style="margin-top:10px"><strong>Slug</strong><br>${escapeHtml(data.slug ?? "")}</div>
-  <div style="margin-top:12px"><strong>URL hasil</strong><div class="row"><input readonly value="${escapeHtml(data.publicUrl ?? "")}" id="publicUrlInput"><button type="button" data-copy="${escapeHtml(data.publicUrl ?? "")}">Copy</button></div></div>
-  <div style="margin-top:12px"><strong>API</strong><div class="row"><input readonly value="${escapeHtml(data.apiUrl ?? "")}" id="apiUrlInput"><button type="button" data-copy="${escapeHtml(data.apiUrl ?? "")}">Copy</button></div></div>
-  <div class="actions"><a class="btn" href="/api/upload">Upload lagi?</a><a class="btn" href="/">Beranda</a></div><details><summary>Lihat data</summary><pre>${escapeHtml(payload)}</pre></details>` : ""}</div>
-  <script>document.querySelectorAll("[data-copy]").forEach(b=>{b.addEventListener("click",async()=>{const t=b.getAttribute("data-copy")||"";try{await navigator.clipboard.writeText(t);const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1e3)}catch(e){const o=b.textContent;b.textContent="Gagal";setTimeout(()=>b.textContent=o,1e3)}})})</script></body></html>`;
+.box{
+  border:1px solid #ddd;
+  border-radius:12px;
+  padding:16px
+}
+
+label{
+  display:block;
+  margin:12px 0 6px
+}
+
+input,
+button{
+  width:100%;
+  box-sizing:border-box;
+  padding:10px;
+  border:1px solid #ccc;
+  border-radius:10px;
+  font:inherit
+}
+
+button{
+  cursor:pointer;
+  background:#111;
+  color:#fff;
+  border:none;
+  margin-top:14px
+}
+
+button:disabled{
+  opacity:.7;
+  cursor:not-allowed
+}
+
+small{
+  color:#666
+}
+
+progress{
+  width:100%;
+  height:16px
+}
+
+pre{
+  white-space:pre-wrap;
+  background:#f6f6f6;
+  border:1px solid #ddd;
+  padding:12px;
+  border-radius:12px;
+  overflow:auto
+}
+
+.row{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px
+}
+
+.muted{
+  color:#666;
+  font-size:.95rem
+}
+
+.hidden{
+  display:none
+}
+
+.radioRow{
+  display:flex;
+  gap:14px;
+  flex-wrap:wrap;
+  margin:8px 0 4px
+}
+
+.radioRow label{
+  display:flex;
+  gap:6px;
+  align-items:center;
+  margin:0
+}
+
+.block{
+  border:1px solid #ddd;
+  border-radius:12px;
+  padding:14px;
+  margin-top:16px
+}
+
+.blockTitle{
+  font-weight:700;
+  margin-bottom:8px
+}
+
+.urlRow{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:8px;
+  align-items:center;
+  margin-top:10px
+}
+
+.urlRow input{
+  width:100%
+}
+
+.copyBtn{
+  width:auto;
+  min-width:86px;
+  padding:10px 12px;
+  background:#f3f4f6;
+  color:#111;
+  border:1px solid #ccc
+}
+
+.actions{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:12px
+}
+
+.secondary{
+  display:inline-block;
+  padding:10px 12px;
+  border:1px solid #ccc;
+  border-radius:10px;
+  color:#111;
+  text-decoration:none;
+  background:#f9f9f9
+}
+
+.hint{
+  margin-top:8px;
+  color:#666;
+  font-size:.95rem
+}
+
+.status{
+  margin-top:12px;
+  font-weight:600
+}
+
+.chunkInfo{
+  display:grid;
+  grid-template-columns:1fr 1fr 1fr;
+  gap:8px;
+  margin-top:12px
+}
+
+.chunkCard{
+  border:1px solid #ddd;
+  border-radius:10px;
+  padding:10px;
+  background:#fafafa
+}
+
+@media(max-width:600px){
+  .chunkInfo{
+    grid-template-columns:1fr
+  }
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Uploader</h1>
+
+<div class="box">
+
+<form
+id="uploadForm"
+method="POST"
+enctype="multipart/form-data"
+>
+
+<label>Judul</label>
+
+<input
+name="title"
+required
+placeholder="contoh: kucing-lucu"
+>
+
+<div
+class="radioRow"
+aria-label="Mode upload"
+>
+
+<label>
+<input
+type="radio"
+name="mode"
+value="video"
+checked
+>
+Upload video (Videy)
+</label>
+
+<label>
+<input
+type="radio"
+name="mode"
+value="b2"
+>
+Upload video (B2)
+</label>
+
+<label>
+<input
+type="radio"
+name="mode"
+value="proxy"
+>
+Upload link (Proxy)
+</label>
+
+</div>
+
+<div id="videoFields">
+
+<label>File video</label>
+
+<input
+type="file"
+name="file"
+accept="video/*"
+>
+
+</div>
+
+<div
+id="proxyFields"
+class="hidden"
+>
+
+<label>Link video sumber</label>
+
+<input
+name="sourceUrl"
+placeholder="https://example.com/video.mp4"
+>
+
+</div>
+
+<label>
+visitorId
+(opsional - khusus Videy)
+</label>
+
+<input
+name="visitorId"
+placeholder="1f5f718b-06b2-40f9-82da-0a73dfdadd1c"
+>
+
+<button
+id="submitBtn"
+type="submit"
+>
+Upload
+</button>
+
+<div class="hint">
+Mode Videy upload ke Videy.
+Mode B2 memakai Chunked Large File otomatis untuk file besar.
+Mode Proxy hanya menyimpan link sumber.
+</div>
+
+</form>
+
+<div
+class="chunkInfo"
+id="chunkInfo"
+hidden
+>
+
+<div class="chunkCard">
+<strong>Mode</strong>
+<div id="chunkMode">-</div>
+</div>
+
+<div class="chunkCard">
+<strong>Chunk</strong>
+<div id="chunkSize">-</div>
+</div>
+
+<div class="chunkCard">
+<strong>Part</strong>
+<div id="chunkPart">-</div>
+</div>
+
+</div>
+
+<div
+style="margin-top:14px"
+>
+
+<progress
+id="progressBar"
+value="0"
+max="100"
+hidden
+>
+</progress>
+
+<div
+class="status"
+id="statusText"
+>
+Siap
+</div>
+
+</div>
+
+<div
+id="resultWrap"
+class="block hidden"
+>
+</div>
+
+</div>
+
+<p>
+<small>
+Semua tetap polos, ringan, dan ramah mata.
+</small>
+</p>
+
+<script>
+
+const form =
+document.getElementById(
+  "uploadForm"
+);
+
+const submitBtn =
+document.getElementById(
+  "submitBtn"
+);
+
+const progressBar =
+document.getElementById(
+  "progressBar"
+);
+
+const statusText =
+document.getElementById(
+  "statusText"
+);
+
+const resultWrap =
+document.getElementById(
+  "resultWrap"
+);
+
+const videoFields =
+document.getElementById(
+  "videoFields"
+);
+
+const proxyFields =
+document.getElementById(
+  "proxyFields"
+);
+
+const chunkInfo =
+document.getElementById(
+  "chunkInfo"
+);
+
+const chunkMode =
+document.getElementById(
+  "chunkMode"
+);
+
+const chunkSizeEl =
+document.getElementById(
+  "chunkSize"
+);
+
+const chunkPartEl =
+document.getElementById(
+  "chunkPart"
+);
+
+const modeRadios =
+[
+  ...form.querySelectorAll(
+    'input[name="mode"]'
+  )
+];
+
+function esc(s){
+
+  return String(
+    s ?? ""
+  )
+  .replace(
+    /&/g,
+    "&amp;"
+  )
+  .replace(
+    /</g,
+    "&lt;"
+  )
+  .replace(
+    />/g,
+    "&gt;"
+  )
+  .replace(
+    /"/g,
+    "&quot;"
+  )
+  .replace(
+    /'/g,
+    "&#39;"
+  );
+
+}
+
+function currentMode(){
+
+  const c =
+    form.querySelector(
+      'input[name="mode"]:checked'
+    );
+
+  return c
+    ? c.value
+    : "video";
+
+}
+
+function toggleMode(){
+
+  const m =
+    currentMode();
+
+  if(
+    m === "proxy"
+  ){
+
+    proxyFields
+      .classList
+      .remove(
+        "hidden"
+      );
+
+    videoFields
+      .classList
+      .add(
+        "hidden"
+      );
+
+  }else{
+
+    proxyFields
+      .classList
+      .add(
+        "hidden"
+      );
+
+    videoFields
+      .classList
+      .remove(
+        "hidden"
+      );
+
+  }
+
+  chunkInfo.hidden =
+    m !== "b2";
+
+}
+
+function setStatus(t){
+
+  statusText.textContent =
+    t;
+
+}
+
+function setLoading(on){
+
+  submitBtn.disabled =
+    on;
+
+  if(on){
+
+    progressBar.hidden =
+      false;
+
+    progressBar.value =
+      0;
+
+  }else{
+
+    progressBar.hidden =
+      true;
+
+    progressBar.value =
+      0;
+
+  }
+
+}
+
+function setChunkInfo(
+  mode,
+  size,
+  part
+){
+
+  chunkMode.textContent =
+    mode || "-";
+
+  chunkSizeEl.textContent =
+    size || "-";
+
+  chunkPartEl.textContent =
+    part || "-";
+
+}
+
+function formatBytes(
+  bytes
+){
+
+  if(
+    !Number.isFinite(
+      bytes
+    )
+  ){
+    return "-";
+  }
+
+  const units =
+    [
+      "B",
+      "KB",
+      "MB",
+      "GB",
+      "TB"
+    ];
+
+  let value =
+    bytes;
+
+  let i =
+    0;
+
+  while(
+    value >= 1024 &&
+    i <
+      units.length - 1
+  ){
+
+    value /=
+      1024;
+
+    i++;
+
+  }
+
+  return (
+    value >= 100
+      ? value.toFixed(0)
+      : value.toFixed(2)
+  ) +
+  " " +
+  units[i];
+
+}
+
+function sleep(
+  ms
+){
+
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+
+}
+
+async function sha1Hex(
+  arrayBuffer
+){
+
+  const hash =
+    await crypto.subtle.digest(
+      "SHA-1",
+      arrayBuffer
+    );
+
+  const bytes =
+    new Uint8Array(
+      hash
+    );
+
+  let output =
+    "";
+
+  for(
+    const byte of bytes
+  ){
+
+    output +=
+      byte
+        .toString(16)
+        .padStart(
+          2,
+          "0"
+        );
+
+  }
+
+  return output;
+
+}
+
+async function jsonFetch(
+  url,
+  options = {}
+){
+
+  const response =
+    await fetch(
+      url,
+      options
+    );
+
+  const text =
+    await response.text();
+
+  let data;
+
+  try{
+
+    data =
+      text
+        ? JSON.parse(
+            text
+          )
+        : {};
+
+  }catch{
+
+    data = {
+      ok:
+        false,
+
+      error:
+        text ||
+        `HTTP ${response.status}`
+    };
+
+  }
+
+  if(
+    !response.ok
+  ){
+
+    const error =
+      new Error(
+        data.error ||
+        `HTTP ${response.status}`
+      );
+
+    error.status =
+      response.status;
+
+    error.data =
+      data;
+
+    throw error;
+
+  }
+
+  return data;
+
+}
+
+async function initChunkUpload(
+  file,
+  title
+){
+
+  const body = {
+
+    title,
+
+    fileName:
+      file.name,
+
+    contentType:
+      file.type ||
+      "video/mp4",
+
+    fileSize:
+      file.size
+
+  };
+
+  return await jsonFetch(
+    "/api/upload/chunk/init",
+    {
+      method:
+        "POST",
+
+      headers:{
+        "Content-Type":
+          "application/json",
+
+        "Accept":
+          "application/json",
+
+        "X-Upload-Debug":
+          "1"
+      },
+
+      body:
+        JSON.stringify(
+          body
+        )
+    }
+  );
+
+}
+
+async function uploadOneChunk(
+  upload,
+  file,
+  partNumber
+){
+
+  const start =
+    (
+      partNumber - 1
+    ) *
+    upload.chunkSize;
+
+  const end =
+    Math.min(
+      file.size,
+      start +
+        upload.chunkSize
+    );
+
+  const blob =
+    file.slice(
+      start,
+      end
+    );
+
+  const arrayBuffer =
+    await blob.arrayBuffer();
+
+  const sha1 =
+    await sha1Hex(
+      arrayBuffer
+    );
+
+  setChunkInfo(
+    "B2 Chunk",
+    formatBytes(
+      blob.size
+    ),
+    `${partNumber}/${upload.totalParts}`
+  );
+
+  return await jsonFetch(
+    `/api/upload/chunk/part?uploadId=${encodeURIComponent(upload.uploadId)}&partNumber=${partNumber}`,
+    {
+      method:
+        "PUT",
+
+      headers:{
+
+        "Content-Type":
+          "application/octet-stream",
+
+        "Accept":
+          "application/json",
+
+        "X-Upload-Token":
+          upload.uploadToken,
+
+        "X-Part-Number":
+          String(partNumber),
+
+        "X-Chunk-Sha1":
+          sha1,
+
+        "X-Chunk-Size":
+          String(
+            blob.size
+          ),
+
+        "X-Upload-Debug":
+          "1"
+      },
+
+      body:
+        arrayBuffer
+    }
+  );
+
+}
+
+async function uploadChunkWithRetry(
+  upload,
+  file,
+  partNumber,
+  retries = 3
+){
+
+  let lastError;
+
+  for(
+    let attempt = 1;
+    attempt <= retries;
+    attempt++
+  ){
+
+    try{
+
+      setStatus(
+        `Upload part ${partNumber}/${upload.totalParts}...`
+      );
+
+      const result =
+        await uploadOneChunk(
+          upload,
+          file,
+          partNumber
+        );
+
+      return result;
+
+    }catch(err){
+
+      lastError =
+        err;
+
+      console.warn(
+        "chunk retry",
+        {
+          partNumber,
+          attempt,
+          error:
+            err?.message ||
+            String(err)
+        }
+      );
+
+      if(
+        attempt <
+        retries
+      ){
+
+        setStatus(
+          `Part ${partNumber} gagal, retry ${attempt + 1}/${retries}...`
+        );
+
+        await sleep(
+          700 *
+          attempt
+        );
+
+      }
+
+    }
+
+  }
+
+  throw lastError;
+
+}
+
+async function completeChunkUpload(
+  upload
+){
+
+  return await jsonFetch(
+    "/api/upload/chunk/complete",
+    {
+      method:
+        "POST",
+
+      headers:{
+        "Content-Type":
+          "application/json",
+
+        "Accept":
+          "application/json",
+
+        "X-Upload-Token":
+          upload.uploadToken,
+
+        "X-Upload-Debug":
+          "1"
+      },
+
+      body:
+        JSON.stringify(
+          {
+            uploadId:
+              upload.uploadId,
+
+            uploadToken:
+              upload.uploadToken
+          }
+        )
+    }
+  );
+
+}
+
+async function statusChunkUpload(
+  upload
+){
+
+  return await jsonFetch(
+    `/api/upload/chunk/status?uploadId=${encodeURIComponent(upload.uploadId)}`,
+    {
+      method:
+        "GET",
+
+      headers:{
+        "Accept":
+          "application/json",
+
+        "X-Upload-Token":
+          upload.uploadToken
+      }
+    }
+  );
+
+}
+
+async function uploadB2Chunked(
+  file,
+  title
+){
+
+  const upload =
+    await initChunkUpload(
+      file,
+      title
+    );
+
+  console.log(
+    "[CHUNK INIT]",
+    upload
+  );
+
+  setChunkInfo(
+    "B2 Chunk",
+    formatBytes(
+      upload.chunkSize
+    ),
+    `0/${upload.totalParts}`
+  );
+
+  localStorage.setItem(
+    "videy_last_chunk_upload",
+    JSON.stringify(
+      {
+        uploadId:
+          upload.uploadId,
+
+        uploadToken:
+          upload.uploadToken,
+
+        fileName:
+          file.name
+      }
+    )
+  );
+
+  /*
+   * Sequential by default.
+   *
+   * Ini sengaja dibuat sequential supaya:
+   * - urutan mudah didiagnosis
+   * - bandwidth HP tidak langsung habis
+   * - setiap request Worker hanya mengurus 1 chunk
+   * - retry part jadi sederhana
+   */
+
+  for(
+    let part = 1;
+    part <=
+      upload.totalParts;
+    part++
+  ){
+
+    const result =
+      await uploadChunkWithRetry(
+        upload,
+        file,
+        part
+      );
+
+    const progress =
+      Number(
+        result.progress ||
+        (
+          part /
+          upload.totalParts *
+          100
+        )
+      );
+
+    progressBar.value =
+      progress;
+
+    setStatus(
+      `Part ${part}/${upload.totalParts} selesai (${progress.toFixed(1)}%)`
+    );
+
+  }
+
+  setStatus(
+    "Semua chunk selesai. B2 sedang menyatukan file..."
+  );
+
+  const status =
+    await statusChunkUpload(
+      upload
+    );
+
+  console.log(
+    "[CHUNK STATUS]",
+    status
+  );
+
+  const result =
+    await completeChunkUpload(
+      upload
+    );
+
+  progressBar.value =
+    100;
+
+  setStatus(
+    "Upload B2 selesai."
+  );
+
+  localStorage.removeItem(
+    "videy_last_chunk_upload"
+  );
+
+  return result;
+
+}
+
+function renderResult(
+  data
+){
+
+  const ok =
+    !!data.ok;
+
+  const title =
+    ok
+      ? (
+          data.mode ===
+          "proxy"
+            ? "Successfully saved proxy"
+            : "Successfully uploaded"
+        )
+      : "Upload gagal";
+
+  const color =
+    ok
+      ? "green"
+      : "red";
+
+  const publicUrl =
+    data.publicUrl ||
+    "";
+
+  const apiUrl =
+    data.apiUrl ||
+    "";
+
+  const order =
+    data.order ??
+    "";
+
+  const slug =
+    data.slug ||
+    "";
+
+  const mode =
+    data.mode ||
+    "";
+
+  const message =
+    data.message ||
+    (
+      ok
+        ? "Selesai."
+        : data.error ||
+          "Terjadi kesalahan."
+    );
+
+  resultWrap
+    .classList
+    .remove(
+      "hidden"
+    );
+
+  resultWrap.innerHTML =
+  `
+  <div
+    class="blockTitle"
+    style="color:${color}"
+  >
+    ${esc(title)}
+  </div>
+
+  <div class="muted">
+    ${esc(message)}
+  </div>
+
+  <div
+    class="row"
+    style="margin-top:10px"
+  >
+
+    <div>
+      <strong>Order</strong>
+      <br>
+      ${esc(order)}
+    </div>
+
+    <div>
+      <strong>Mode</strong>
+      <br>
+      ${esc(mode)}
+    </div>
+
+  </div>
+
+  <div style="margin-top:10px">
+
+    <strong>Slug</strong>
+
+    <br>
+
+    ${esc(slug)}
+
+  </div>
+
+  <div style="margin-top:12px">
+
+    <strong>URL hasil</strong>
+
+    <div class="urlRow">
+
+      <input
+        readonly
+        value="${esc(
+          publicUrl
+        )}"
+        id="publicUrlInput"
+      >
+
+      <button
+        type="button"
+        class="copyBtn"
+        data-copy="${esc(
+          publicUrl
+        )}"
+      >
+        Copy
+      </button>
+
+    </div>
+
+  </div>
+
+  <div style="margin-top:12px">
+
+    <strong>API</strong>
+
+    <div class="urlRow">
+
+      <input
+        readonly
+        value="${esc(
+          apiUrl
+        )}"
+        id="apiUrlInput"
+      >
+
+      <button
+        type="button"
+        class="copyBtn"
+        data-copy="${esc(
+          apiUrl
+        )}"
+      >
+        Copy
+      </button>
+
+    </div>
+
+  </div>
+
+  <div class="actions">
+
+    <a
+      class="secondary"
+      href="/api/upload"
+    >
+      Upload lagi?
+    </a>
+
+    <button
+      type="button"
+      class="secondary"
+      id="resetBtn"
+    >
+      Bersihkan
+    </button>
+
+  </div>
+
+  <details
+    style="margin-top:12px"
+  >
+
+    <summary>
+      Lihat data/debug
+    </summary>
+
+    <pre>
+${esc(
+  JSON.stringify(
+    data,
+    null,
+    2
+  )
+)}
+    </pre>
+
+  </details>
+  `;
+
+  resultWrap
+    .querySelectorAll(
+      "[data-copy]"
+    )
+    .forEach(
+      b => {
+
+        b.addEventListener(
+          "click",
+          async () => {
+
+            const t =
+              b.getAttribute(
+                "data-copy"
+              ) ||
+              "";
+
+            try{
+
+              await navigator
+                .clipboard
+                .writeText(
+                  t
+                );
+
+              const old =
+                b.textContent;
+
+              b.textContent =
+                "Copied";
+
+              setTimeout(
+                () => {
+                  b.textContent =
+                    old;
+                },
+                1000
+              );
+
+            }catch{
+
+              const old =
+                b.textContent;
+
+              b.textContent =
+                "Gagal";
+
+              setTimeout(
+                () => {
+                  b.textContent =
+                    old;
+                },
+                1000
+              );
+
+            }
+
+          }
+        );
+
+      }
+    );
+
+  const reset =
+    resultWrap
+      .querySelector(
+        "#resetBtn"
+      );
+
+  if(
+    reset
+  ){
+
+    reset.addEventListener(
+      "click",
+      () => {
+
+        form.reset();
+
+        toggleMode();
+
+        resultWrap
+          .classList
+          .add(
+            "hidden"
+          );
+
+        resultWrap.innerHTML =
+          "";
+
+        setStatus(
+          "Siap"
+        );
+
+        chunkInfo.hidden =
+          true;
+
+        window.scrollTo(
+          {
+            top:
+              0,
+
+            behavior:
+              "smooth"
+          }
+        );
+
+      }
+    );
+
+  }
+
+}
+
+modeRadios.forEach(
+  r =>
+    r.addEventListener(
+      "change",
+      toggleMode
+    )
+);
+
+toggleMode();
+
+form.addEventListener(
+  "submit",
+  async function(e){
+
+    e.preventDefault();
+
+    resultWrap
+      .classList
+      .add(
+        "hidden"
+      );
+
+    resultWrap.innerHTML =
+      "";
+
+    const m =
+      currentMode();
+
+    const fd =
+      new FormData(
+        form
+      );
+
+    const file =
+      form
+        .querySelector(
+          'input[type="file"]'
+        )
+        ?.files?.[0];
+
+    try{
+
+      setLoading(
+        true
+      );
+
+      /*
+       * B2 SELALU pakai chunked.
+       *
+       * Ini penting:
+       * request besar TIDAK dikirim ke /api/upload.
+       * Browser memotong file menjadi request kecil.
+       */
+
+      if(
+        m === "b2"
+      ){
+
+        if(
+          !file
+        ){
+
+          throw new Error(
+            "File video wajib dipilih."
+          );
+
+        }
+
+        setStatus(
+          `Menyiapkan B2 Chunked (${formatBytes(file.size)})...`
+        );
+
+        const result =
+          await uploadB2Chunked(
+            file,
+            form
+              .querySelector(
+                'input[name="title"]'
+              )
+              .value
+          );
+
+        renderResult(
+          result
+        );
+
+        return;
+
+      }
+
+      /*
+       * PROXY / VIDEY LAMA
+       */
+
+      if(
+        m === "proxy"
+      ){
+
+        fd.delete(
+          "file"
+        );
+
+      }else{
+
+        fd.delete(
+          "sourceUrl"
+        );
+
+      }
+
+      setStatus(
+        m === "proxy"
+          ? "Menyimpan link..."
+          : "Menyiapkan upload..."
+      );
+
+      await new Promise(
+        (
+          resolve,
+          reject
+        ) => {
+
+          const xhr =
+            new XMLHttpRequest();
+
+          xhr.open(
+            "POST",
+            "/api/upload",
+            true
+          );
+
+          xhr.setRequestHeader(
+            "Accept",
+            "application/json"
+          );
+
+          xhr.upload.onprogress =
+            function(ev){
+
+              if(
+                m === "video" &&
+                ev.lengthComputable
+              ){
+
+                const p =
+                  Math.round(
+                    ev.loaded /
+                    ev.total *
+                    100
+                  );
+
+                progressBar.hidden =
+                  false;
+
+                progressBar.value =
+                  p;
+
+                setStatus(
+                  `Mengirim... ${p}%`
+                );
+
+              }else{
+
+                progressBar.hidden =
+                  false;
+
+                setStatus(
+                  m === "proxy"
+                    ? "Menyimpan link..."
+                    : "Mengirim..."
+                );
+
+              }
+
+            };
+
+          xhr.onreadystatechange =
+            function(){
+
+              if(
+                xhr.readyState ===
+                2
+              ){
+
+                setStatus(
+                  "Memproses respons..."
+                );
+
+              }
+
+              if(
+                xhr.readyState ===
+                4
+              ){
+
+                setLoading(
+                  false
+                );
+
+                let data =
+                  xhr.responseText;
+
+                try{
+
+                  data =
+                    JSON.parse(
+                      xhr.responseText
+                    );
+
+                }catch{}
+
+                if(
+                  xhr.status >=
+                    200 &&
+                  xhr.status <
+                    300
+                ){
+
+                  setStatus(
+                    "Selesai"
+                  );
+
+                  renderResult(
+                    data
+                  );
+
+                  resolve();
+
+                }else{
+
+                  setStatus(
+                    "Gagal"
+                  );
+
+                  renderResult(
+                    data
+                  );
+
+                  reject(
+                    new Error(
+                      data?.error ||
+                      `HTTP ${xhr.status}`
+                    )
+                  );
+
+                }
+
+              }
+
+            };
+
+          xhr.onerror =
+            function(){
+
+              setLoading(
+                false
+              );
+
+              setStatus(
+                "Gagal jaringan"
+              );
+
+              renderResult(
+                {
+                  ok:
+                    false,
+
+                  error:
+                    "Terjadi error jaringan."
+                }
+              );
+
+              reject(
+                new Error(
+                  "Network error"
+                )
+              );
+
+            };
+
+          xhr.send(
+            fd
+          );
+
+        }
+      );
+
+    }catch(err){
+
+      console.error(
+        "[UPLOAD UI]",
+        err
+      );
+
+      setLoading(
+        false
+      );
+
+      setStatus(
+        "Gagal"
+      );
+
+      renderResult(
+        {
+          ok:
+            false,
+
+          error:
+            err?.message ||
+            String(err)
+        }
+      );
+
+    }finally{
+
+      submitBtn.disabled =
+        false;
+
+    }
+
+  }
+);
+
+</script>
+
+</body>
+</html>`;
+}
+
+// ============================================================
+// RESULT HTML
+// ============================================================
+
+function renderResultBlock(
+  {
+    title,
+    message,
+    data = null,
+    color = "black"
+  }
+) {
+  const payload =
+    data
+      ? JSON.stringify(
+          data,
+          null,
+          2
+        )
+      : "";
+
+  return `<!doctype html>
+<html lang="id">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>
+${escapeHtml(title)}
+</title>
+
+<style>
+
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-width:760px;
+  margin:40px auto;
+  padding:0 16px;
+  line-height:1.5
+}
+
+.block{
+  border:1px solid #ddd;
+  border-radius:12px;
+  padding:16px
+}
+
+.top{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:center;
+  flex-wrap:wrap
+}
+
+.title{
+  font-weight:700
+}
+
+.muted{
+  color:#666
+}
+
+.row{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:8px;
+  align-items:center;
+  margin-top:10px
+}
+
+input{
+  width:100%;
+  box-sizing:border-box;
+  padding:10px;
+  border:1px solid #ccc;
+  border-radius:10px;
+  font:inherit
+}
+
+button,
+a.btn{
+  padding:10px 12px;
+  border:1px solid #ccc;
+  border-radius:10px;
+  background:#f9f9f9;
+  color:#111;
+  text-decoration:none;
+  display:inline-block;
+  cursor:pointer
+}
+
+.actions{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:12px
+}
+
+pre{
+  white-space:pre-wrap;
+  background:#f6f6f6;
+  border:1px solid #ddd;
+  padding:12px;
+  border-radius:12px;
+  overflow:auto;
+  margin-top:12px
+}
+
+details{
+  margin-top:12px
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="block">
+
+<div class="top">
+
+<div
+class="title"
+style="color:${color}"
+>
+${escapeHtml(title)}
+</div>
+
+<div>
+${escapeHtml(message)}
+</div>
+
+</div>
+
+${
+  data
+    ? `
+
+<div
+style="margin-top:10px"
+>
+<strong>Order</strong>
+<br>
+${escapeHtml(
+  data.order ??
+  ""
+)}
+</div>
+
+<div
+style="margin-top:10px"
+>
+<strong>Mode</strong>
+<br>
+${escapeHtml(
+  data.mode ??
+  ""
+)}
+</div>
+
+<div
+style="margin-top:10px"
+>
+<strong>Slug</strong>
+<br>
+${escapeHtml(
+  data.slug ??
+  ""
+)}
+</div>
+
+<div
+style="margin-top:12px"
+>
+
+<strong>URL hasil</strong>
+
+<div class="row">
+
+<input
+readonly
+value="${escapeHtml(
+  data.publicUrl ??
+  ""
+)}"
+id="publicUrlInput"
+>
+
+<button
+type="button"
+data-copy="${escapeHtml(
+  data.publicUrl ??
+  ""
+)}"
+>
+Copy
+</button>
+
+</div>
+
+</div>
+
+<div
+style="margin-top:12px"
+>
+
+<strong>API</strong>
+
+<div class="row">
+
+<input
+readonly
+value="${escapeHtml(
+  data.apiUrl ??
+  ""
+)}"
+id="apiUrlInput"
+>
+
+<button
+type="button"
+data-copy="${escapeHtml(
+  data.apiUrl ??
+  ""
+)}"
+>
+Copy
+</button>
+
+</div>
+
+</div>
+
+<div class="actions">
+
+<a
+class="btn"
+href="/api/upload"
+>
+Upload lagi?
+</a>
+
+<a
+class="btn"
+href="/"
+>
+Beranda
+</a>
+
+</div>
+
+<details>
+
+<summary>
+Lihat data
+</summary>
+
+<pre>
+${escapeHtml(
+  payload
+)}
+</pre>
+
+</details>
+
+`
+    : ""
+}
+
+</div>
+
+<script>
+
+document
+  .querySelectorAll(
+    "[data-copy]"
+  )
+  .forEach(
+    b => {
+
+      b.addEventListener(
+        "click",
+        async () => {
+
+          const t =
+            b.getAttribute(
+              "data-copy"
+            ) ||
+            "";
+
+          try{
+
+            await navigator
+              .clipboard
+              .writeText(
+                t
+              );
+
+            const o =
+              b.textContent;
+
+            b.textContent =
+              "Copied";
+
+            setTimeout(
+              () =>
+                b.textContent =
+                  o,
+              1000
+            );
+
+          }catch{
+
+            const o =
+              b.textContent;
+
+            b.textContent =
+              "Gagal";
+
+            setTimeout(
+              () =>
+                b.textContent =
+                  o,
+              1000
+            );
+
+          }
+
+        }
+      );
+
+    }
+  );
+
+</script>
+
+</body>
+</html>`;
+}
+
+// ============================================================
+// LIST HTML
+// ============================================================
+
+function renderListHtml(
+  items,
+  hasMore,
+  page,
+  limit,
+  url,
+  sourceType
+) {
+  const nextPageUrl =
+    hasMore
+      ? `${url.origin}${url.pathname}?page=${page + 1}&limit=${limit}`
+      : null;
+
+  const prevPageUrl =
+    page > 1
+      ? `${url.origin}${url.pathname}?page=${page - 1}&limit=${limit}`
+      : null;
+
+  let html =
+  `<!doctype html>
+<html lang="id">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>
+Daftar Video
+(${escapeHtml(
+  sourceType
+)})
+</title>
+
+<style>
+
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-width:920px;
+  margin:40px auto;
+  padding:0 16px;
+  line-height:1.5
+}
+
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:16px
+}
+
+th,
+td{
+  border:1px solid #ddd;
+  padding:8px;
+  text-align:left;
+  word-break:break-all
+}
+
+th{
+  background:#f4f4f5
+}
+
+.pagination{
+  margin-top:20px;
+  display:flex;
+  gap:12px;
+  justify-content:center;
+  flex-wrap:wrap
+}
+
+.btn{
+  padding:10px 16px;
+  background:#111;
+  color:#fff;
+  text-decoration:none;
+  border-radius:8px;
+  display:inline-block
+}
+
+.btn.disabled{
+  background:#ccc;
+  pointer-events:none;
+  cursor:not-allowed
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>
+Daftar Video
+(${escapeHtml(
+  sourceType
+)})
+</h1>
+
+<p>
+<a href="/api/upload">
+Upload video baru
+</a>
+|
+<a href="/">
+Beranda
+</a>
+</p>
+
+<table>
+
+<thead>
+
+<tr>
+<th>Order</th>
+<th>Slug</th>
+<th>Title</th>
+<th>Mode</th>
+<th>Stream URL</th>
+</tr>
+
+</thead>
+
+<tbody>`;
+
+  for (
+    const item of items
+  ) {
+    const pubUrl =
+      `${url.origin}/${item.order}/${item.slug}.mp4`;
+
+    html +=
+      `<tr>
+<td>
+${escapeHtml(
+  item.order
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.slug
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.title
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.mode
+)}
+</td>
+
+<td>
+<a
+href="${escapeHtml(
+  pubUrl
+)}"
+target="_blank"
+>
+Buka
+</a>
+</td>
+
+</tr>`;
+  }
+
+  html +=
+  `</tbody>
+
+</table>
+
+<div class="pagination">
+
+<a
+href="${prevPageUrl || "#"}"
+class="btn ${
+  !prevPageUrl
+    ? "disabled"
+    : ""
+}"
+>
+← Halaman Sebelumnya
+</a>
+
+<a
+href="${nextPageUrl || "#"}"
+class="btn ${
+  !hasMore
+    ? "disabled"
+    : ""
+}"
+>
+Halaman Berikutnya →
+</a>
+
+</div>
+
+</body>
+
+</html>`;
+
+  return html;
+}
+
+// ============================================================
+// LEGACY LIST HTML
+// ============================================================
+
+function renderLegacyListHtml(
+  items,
+  hasMore,
+  nextCursor,
+  limit,
+  url
+) {
+  const nextUrl =
+    hasMore &&
+    nextCursor
+      ? `${url.origin}${url.pathname}?limit=${limit}&cursor=${encodeURIComponent(nextCursor)}`
+      : null;
+
+  let html =
+  `<!doctype html>
+<html lang="id">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>
+Daftar Video (KV Legacy)
+</title>
+
+<style>
+
+body{
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+  max-width:920px;
+  margin:40px auto;
+  padding:0 16px;
+  line-height:1.5
+}
+
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:16px
+}
+
+th,
+td{
+  border:1px solid #ddd;
+  padding:8px;
+  text-align:left;
+  word-break:break-all
+}
+
+th{
+  background:#f4f4f5
+}
+
+.pagination{
+  margin-top:20px;
+  display:flex;
+  gap:12px;
+  justify-content:center;
+  flex-wrap:wrap
+}
+
+.btn{
+  padding:10px 16px;
+  background:#111;
+  color:#fff;
+  text-decoration:none;
+  border-radius:8px;
+  display:inline-block
+}
+
+.btn.disabled{
+  background:#ccc;
+  pointer-events:none;
+  cursor:not-allowed
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>
+Daftar Video (KV Legacy)
+</h1>
+
+<p>
+<a href="/api/upload">
+Upload video baru
+</a>
+|
+<a href="/">
+Beranda
+</a>
+</p>
+
+<table>
+
+<thead>
+
+<tr>
+<th>Order</th>
+<th>Slug</th>
+<th>Title</th>
+<th>Mode</th>
+<th>Stream URL</th>
+</tr>
+
+</thead>
+
+<tbody>`;
+
+  for (
+    const item of items
+  ) {
+    const pubUrl =
+      `${url.origin}/${item.order}/${item.slug}.mp4`;
+
+    html +=
+      `<tr>
+
+<td>
+${escapeHtml(
+  item.order
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.slug
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.title
+)}
+</td>
+
+<td>
+${escapeHtml(
+  item.mode
+)}
+</td>
+
+<td>
+<a
+href="${escapeHtml(
+  pubUrl
+)}"
+target="_blank"
+>
+Buka
+</a>
+</td>
+
+</tr>`;
+  }
+
+  html +=
+  `</tbody>
+
+</table>
+
+<div class="pagination">
+
+<a
+href="${nextUrl || "#"}"
+class="btn ${
+  !nextUrl
+    ? "disabled"
+    : ""
+}"
+>
+Halaman Berikutnya →
+</a>
+
+</div>
+
+</body>
+
+</html>`;
+
+  return html;
+}
+
+// ============================================================
+// ESCAPE
+// ============================================================
+
+function escapeHtml(
+  value
+) {
+  return String(
+    value ??
+      ""
+  )
+    .replace(
+      /&/g,
+      "&amp;"
+    )
+    .replace(
+      /</g,
+      "&lt;"
+    )
+    .replace(
+      />/g,
+      "&gt;"
+    )
+    .replace(
+      /"/g,
+      "&quot;"
+    )
+    .replace(
+      /'/g,
+      "&#39;"
+    );
+}
+
+// ============================================================
+// OPTIONAL CORS PREFLIGHT
+// ============================================================
+//
+// Kalau upload dari domain berbeda, fetch browser dapat memakai
+// OPTIONS. Router utama di atas belum membutuhkan endpoint khusus,
+// jadi helper ini disediakan untuk dipakai bila ingin ditambahkan.
+// ============================================================
+
+function corsOptionsResponse(
+  requestId
+) {
+  return new Response(
+    null,
+    {
+      status:
+        204,
+
+      headers:
+        makeChunkHeaders(
+          requestId
+        )
+    }
+  );
 }
