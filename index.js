@@ -1,6 +1,6 @@
 // index.js
 //
-// CHUNKED B2 UPLOAD
+// CHUNKED B2 UPLOAD + IMAGE SUPPORT
 // - Menjaga API upload lama tetap ada.
 // - Menambahkan:
 //
@@ -8,6 +8,7 @@
 //   PUT  /api/upload/chunk/part?uploadId=...&partNumber=...
 //   POST /api/upload/chunk/complete
 //   GET  /api/upload/chunk/status?uploadId=...
+//   POST /api/upload/image            <- [NEW] Gambar B2 only
 //
 // - Chunk dikirim langsung sebagai request body, bukan multipart FormData.
 // - Worker tidak memuat file 2.26 GB ke memory.
@@ -18,16 +19,17 @@
 // - Ada token session agar upload tidak bisa dipalsukan hanya dengan uploadId.
 // - Debug diperketat melalui X-Upload-Debug dan /status.
 // - API /api/upload lama tetap dipertahankan untuk kompatibilitas.
+// - [NEW] Dukungan gambar B2 (single-shot, max 25 MiB).
 //
 // Cloudflare membatasi request body Free/Pro 100 MB dan Business 200 MB,
-// sehingga 50 MiB/chunk menjadi pilihan aman. 0
+// sehingga 50 MiB/chunk menjadi pilihan aman.
 //
 // B2 Large File menggunakan:
 // b2_start_large_file
 // b2_get_upload_part_url
 // b2_upload_part
 // b2_finish_large_file
-// dan setiap part wajib mempunyai SHA-1 + Content-Length. 1
+// dan setiap part wajib mempunyai SHA-1 + Content-Length.
 
 const UPLOAD_PATH = "/api/upload";
 const VIDEO_PREFIX = "video:";
@@ -65,6 +67,40 @@ const CHUNK_UPLOAD_EXPIRY_MS = 24 * 60 * 60 * 1000;
 const UPLOAD_TOKEN_BYTES = 24;
 
 const DEBUG_HEADER = "X-Upload-Debug";
+
+// ============================================================
+// IMAGE CONFIG (B2 ONLY)  [NEW]
+// ============================================================
+
+const MAX_IMAGE_SIZE = 25 * 1024 * 1024; // 25 MiB
+
+const IMAGE_MIME_TO_EXT = {
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/png": ".png",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/avif": ".avif",
+  "image/bmp": ".bmp",
+  "image/tiff": ".tiff",
+  "image/svg+xml": ".svg",
+  "image/x-icon": ".ico"
+};
+
+const IMAGE_EXT_TO_MIME = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".avif": "image/avif",
+  ".bmp": "image/bmp",
+  ".tiff": "image/tiff",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon"
+};
+
+const IMAGE_EXTENSIONS = Object.keys(IMAGE_EXT_TO_MIME);
 
 // Cache autentikasi & B2 Info agar tidak bolak-balik login
 let b2AuthCache = {
@@ -200,6 +236,28 @@ export default {
       }
 
       // --------------------------------------------------------
+      // B2 IMAGE UPLOAD (SINGLE-SHOT)  [NEW]
+      // --------------------------------------------------------
+
+      if (pathname === "/api/upload/image") {
+        if (request.method !== "POST") {
+          return jsonResponse(
+            {
+              ok: false,
+              error: "method_not_allowed",
+              requestId
+            },
+            405,
+            {
+              "X-Request-Id": requestId
+            }
+          );
+        }
+
+        return await handleImageUpload(request, env, url, requestId);
+      }
+
+      // --------------------------------------------------------
       // LIST
       // --------------------------------------------------------
 
@@ -225,7 +283,7 @@ export default {
       }
 
       // --------------------------------------------------------
-      // PUBLIC VIDEO
+      // PUBLIC VIDEO / IMAGE
       // --------------------------------------------------------
 
       const route = parsePublicRoute(pathname);
@@ -280,6 +338,8 @@ async function ensureD1Schema(env) {
             videy_id TEXT,
             source_url TEXT,
             b2_file_name TEXT,
+            content_type TEXT,
+            media_type TEXT,
             created_at TEXT
           )
         `).run();
@@ -305,7 +365,7 @@ async function ensureD1Schema(env) {
           .run();
 
         // ------------------------------------------------------
-        // AUTO MIGRATE VIDEO TABLE
+        // AUTO MIGRATE VIDEO TABLE  [NEW COLUMNS]
         // ------------------------------------------------------
 
         try {
@@ -320,6 +380,26 @@ async function ensureD1Schema(env) {
               .prepare(`
                 ALTER TABLE ${D1_VIDEOS_TABLE}
                 ADD COLUMN b2_file_name TEXT
+              `)
+              .run();
+          }
+
+          // [NEW] content_type
+          if (!columns.includes("content_type")) {
+            await db
+              .prepare(`
+                ALTER TABLE ${D1_VIDEOS_TABLE}
+                ADD COLUMN content_type TEXT
+              `)
+              .run();
+          }
+
+          // [NEW] media_type
+          if (!columns.includes("media_type")) {
+            await db
+              .prepare(`
+                ALTER TABLE ${D1_VIDEOS_TABLE}
+                ADD COLUMN media_type TEXT
               `)
               .run();
           }
@@ -1042,6 +1122,85 @@ async function b2FinishLargeFile(
   }
 
   return data;
+}
+
+// ============================================================
+// B2 IMAGE UPLOAD (SINGLE SHOT)  [NEW]
+// ============================================================
+
+async function b2UploadImage(
+  file,
+  fileName,
+  contentType,
+  env
+) {
+  try {
+    const auth = await getB2Auth(env);
+    const bucketId = await getB2BucketId(env, auth);
+
+    const getUrlResp = await fetch(
+      `${auth.apiUrl}/b2api/v2/b2_get_upload_url`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": auth.token,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ bucketId })
+      }
+    );
+
+    if (!getUrlResp.ok) {
+      return {
+        ok: false,
+        error: "B2 get_upload_url gagal",
+        raw: (await safeReadText(getUrlResp)).slice(0, 1000)
+      };
+    }
+
+    const uploadData = await getUrlResp.json();
+
+    const arrayBuffer = await file.arrayBuffer();
+
+    const uploadResp = await fetch(uploadData.uploadUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": uploadData.authorizationToken,
+        "X-Bz-File-Name": encodeURIComponent(fileName),
+        "Content-Type": contentType,
+        "X-Bz-Content-Sha1": "do_not_verify",
+        "Content-Length": String(arrayBuffer.byteLength)
+      },
+      body: arrayBuffer
+    });
+
+    if (!uploadResp.ok) {
+      return {
+        ok: false,
+        error: "B2 upload image gagal",
+        raw: (await safeReadText(uploadResp)).slice(0, 1000)
+      };
+    }
+
+    const result = await uploadResp.json();
+
+    const publicUrl =
+      `${auth.downloadUrl}/file/` +
+      `${encodeURIComponent(env.B2_BUCKET_NAME)}/` +
+      `${encodeURIComponent(fileName)}`;
+
+    return {
+      ok: true,
+      fileId: result.fileId,
+      publicUrl,
+      fileName
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || String(err)
+    };
+  }
 }
 
 // ============================================================
@@ -2832,6 +2991,13 @@ async function handleChunkComplete(
           mode:
             "b2",
 
+          mediaType:
+            "video",
+
+          contentType:
+            session.content_type ||
+            "video/mp4",
+
           sourceUrl:
             publicSourceUrl,
 
@@ -2866,6 +3032,9 @@ async function handleChunkComplete(
 
       mode:
         saved.mode,
+
+      mediaType:
+        "video",
 
       createdAt:
         saved.createdAt,
@@ -3045,6 +3214,216 @@ async function handleChunkComplete(
 }
 
 // ============================================================
+// HANDLE IMAGE UPLOAD  [NEW]
+// ============================================================
+
+async function handleImageUpload(
+  request,
+  env,
+  url,
+  requestId
+) {
+  const debug = isDebugRequest(request);
+  const started = Date.now();
+
+  try {
+    const db = getD1(env);
+
+    if (!db) {
+      return jsonResponse(
+        { ok: false, error: "d1_not_available", requestId },
+        503
+      );
+    }
+
+    await ensureD1Schema(env);
+
+    const declaredLength = Number(
+      request.headers.get("Content-Length") || 0
+    );
+
+    if (
+      declaredLength > 0 &&
+      declaredLength > MAX_IMAGE_SIZE + 512 * 1024
+    ) {
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            `Ukuran request melebihi batas ${MAX_IMAGE_SIZE} byte`,
+          requestId
+        },
+        413
+      );
+    }
+
+    const form = await request.formData();
+
+    const title = clean(form.get("title"));
+    const file = form.get("file");
+
+    if (!title) {
+      return jsonResponse(
+        { ok: false, error: "Judul wajib diisi", requestId },
+        400
+      );
+    }
+
+    if (!(file instanceof File) || file.size <= 0) {
+      return jsonResponse(
+        { ok: false, error: "File gambar wajib dipilih", requestId },
+        400
+      );
+    }
+
+    if (file.size > MAX_IMAGE_SIZE) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: `Ukuran gambar maksimum ${MAX_IMAGE_SIZE} byte`,
+          requestId
+        },
+        413
+      );
+    }
+
+    const contentType = file.type || "image/jpeg";
+
+    if (!contentType.startsWith("image/")) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: "Hanya file gambar (image/*) yang didukung",
+          requestId
+        },
+        400
+      );
+    }
+
+    const ext =
+      IMAGE_MIME_TO_EXT[contentType] ||
+      getSafeExtension(file.name, contentType) ||
+      ".jpg";
+
+    const baseSlug = slugify(title);
+    const fileName = `${Date.now()}-${baseSlug}${ext}`;
+
+    console.log("[IMAGE UPLOAD]", JSON.stringify({
+      requestId, title, fileName, size: file.size, contentType
+    }));
+
+    const upload = await b2UploadImage(
+      file,
+      fileName,
+      contentType,
+      env
+    );
+
+    if (!upload.ok) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: `Upload gambar B2 gagal: ${upload.error}`,
+          raw: upload.raw,
+          requestId
+        },
+        502
+      );
+    }
+
+    const slugCandidate = await uniqueSlug(env, baseSlug);
+    const createdAt = new Date().toISOString();
+
+    const saved = await saveRecord(env, {
+      title,
+      slug: slugCandidate,
+      mode: "b2",
+      mediaType: "image",
+      contentType,
+      sourceUrl: upload.publicUrl,
+      b2FileName: upload.fileName,
+      createdAt
+    });
+
+    const publicUrl =
+      `${url.origin}/${saved.order}/${saved.slug}${ext}`;
+    const apiUrl =
+      `${url.origin}/api/video/${saved.order}/${saved.slug}`;
+
+    // Optional KV mirror
+    let kvMirrored = false;
+    let kvError = "";
+
+    if (shouldMirrorKv(env) && env?.VIDEY_KV) {
+      try {
+        await env.VIDEY_KV.put(
+          makeVideoKey(saved.order, saved.slug),
+          JSON.stringify({
+            title: saved.title,
+            slug: saved.slug,
+            order: saved.order,
+            mode: saved.mode,
+            mediaType: "image",
+            contentType,
+            createdAt: saved.createdAt,
+            sourceUrl: saved.sourceUrl,
+            b2FileName: saved.b2FileName
+          })
+        );
+        kvMirrored = true;
+      } catch (err) {
+        kvError = err?.message || String(err);
+      }
+    }
+
+    const response = {
+      ok: true,
+      mediaType: "image",
+      contentType,
+      order: saved.order,
+      slug: saved.slug,
+      title: saved.title,
+      publicUrl,
+      apiUrl,
+      b2FileName: saved.b2FileName,
+      b2FileId: upload.fileId,
+      storage: {
+        d1: !!saved.storedInD1,
+        kv: kvMirrored
+      },
+      message: kvMirrored
+        ? "Gambar berhasil diupload ke B2 dan metadata tersimpan di D1 + KV."
+        : "Gambar berhasil diupload ke B2 dan metadata tersimpan di D1.",
+      requestId
+    };
+
+    if (debug) {
+      response.debug = {
+        stage: "image-upload",
+        elapsedMs: Date.now() - started,
+        size: file.size
+      };
+    }
+
+    return jsonResponse(response, 200);
+  } catch (err) {
+    console.error("[IMAGE UPLOAD ERROR]", requestId, err);
+
+    return jsonResponse(
+      {
+        ok: false,
+        error: err?.message || String(err),
+        requestId,
+        debug: debug
+          ? { stage: "image-upload", elapsedMs: Date.now() - started }
+          : undefined
+      },
+      500
+    );
+  }
+}
+
+// ============================================================
 // UPLOAD DEBUG
 // ============================================================
 
@@ -3158,7 +3537,18 @@ function getSafeExtension(
     "video/webm": ".webm",
     "video/x-matroska": ".mkv",
     "video/quicktime": ".mov",
-    "video/x-msvideo": ".avi"
+    "video/x-msvideo": ".avi",
+    // [NEW] Image fallbacks
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/avif": ".avif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/svg+xml": ".svg",
+    "image/x-icon": ".ico"
   };
 
   return (
@@ -3479,7 +3869,7 @@ async function handleUpload(
   }
 
   // ----------------------------------------------------------
-  // B2 LEGACY
+  // B2 LEGACY (+ IMAGE SUPPORT)  [UPDATED]
   // ----------------------------------------------------------
 
   if (
@@ -3490,7 +3880,7 @@ async function handleUpload(
       file.size <= 0
     ) {
       return respondUploadError(
-        "File video wajib dipilih untuk mode B2.",
+        "File video/gambar wajib dipilih untuk mode B2.",
         {
           mode,
           requestId
@@ -3500,18 +3890,90 @@ async function handleUpload(
       );
     }
 
-    // --------------------------------------------------------
-    // Force chunked for large files.
-    //
-    // Request sudah terlanjur sampai Worker, sehingga limit
-    // Cloudflare tetap berlaku. Ini terutama menangani file
-    // kecil/menengah yang masih lolos request-size limit.
-    // --------------------------------------------------------
-
     const baseSlug =
       slugify(
         title
       );
+
+    // --------------------------------------------------------
+    // IMAGE HANDLING (B2 only)  [NEW]
+    // --------------------------------------------------------
+
+    const isImageFile =
+      String(file.type || "").startsWith("image/");
+
+    if (isImageFile) {
+      if (file.size > MAX_IMAGE_SIZE) {
+        return respondUploadError(
+          `Ukuran gambar maksimum ${MAX_IMAGE_SIZE} byte.`,
+          { mode, requestId },
+          413,
+          request
+        );
+      }
+
+      const ext =
+        IMAGE_MIME_TO_EXT[file.type] ||
+        getSafeExtension(file.name, file.type) ||
+        ".jpg";
+
+      const imgFileName = `${Date.now()}-${baseSlug}${ext}`;
+
+      const uploadImg = await b2UploadImage(
+        file,
+        imgFileName,
+        file.type || "image/jpeg",
+        env
+      );
+
+      if (!uploadImg.ok) {
+        return respondUploadError(
+          `Upload gambar B2 gagal: ${uploadImg.error}`,
+          { mode, raw: uploadImg.raw, requestId },
+          502,
+          request
+        );
+      }
+
+      const slugCandidateImg = await uniqueSlug(env, baseSlug);
+
+      const savedImg = await saveRecord(env, {
+        title,
+        slug: slugCandidateImg,
+        mode: "b2",
+        mediaType: "image",
+        contentType: file.type || "image/jpeg",
+        sourceUrl: uploadImg.publicUrl,
+        b2FileName: uploadImg.fileName,
+        createdAt
+      });
+
+      const publicUrlImg =
+        `${url.origin}/${savedImg.order}/${savedImg.slug}${ext}`;
+      const apiUrlImg =
+        `${url.origin}/api/video/${savedImg.order}/${savedImg.slug}`;
+
+      return respondUploadSuccess(
+        {
+          publicUrl: publicUrlImg,
+          apiUrl: apiUrlImg,
+          order: savedImg.order,
+          slug: savedImg.slug,
+          mode,
+          mediaType: "image",
+          contentType: file.type || "image/jpeg",
+          title,
+          message: "Gambar B2 berhasil disimpan.",
+          storage: { d1: !!savedImg.storedInD1, kv: false },
+          requestId
+        },
+        request
+      );
+    }
+
+    // --------------------------------------------------------
+    // VIDEO B2 (existing path)
+    // --------------------------------------------------------
 
     const upload =
       await uploadToB2(
@@ -3549,6 +4011,11 @@ async function handleUpload(
             slugCandidate,
           mode:
             "b2",
+          mediaType:
+            "video",
+          contentType:
+            file.type ||
+            "video/mp4",
           sourceUrl:
             upload.publicUrl,
           b2FileName:
@@ -3581,6 +4048,9 @@ async function handleUpload(
 
       mode:
         saved.mode,
+
+      mediaType:
+        "video",
 
       createdAt:
         saved.createdAt,
@@ -3827,7 +4297,7 @@ async function handleUpload(
 }
 
 // ============================================================
-// SAVE RECORD
+// SAVE RECORD  [UPDATED]
 // ============================================================
 
 async function saveRecord(
@@ -3890,21 +4360,22 @@ async function saveRecord(
             videy_id,
             source_url,
             b2_file_name,
+            content_type,
+            media_type,
             created_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .bind(
           order,
           slug,
           draft.title,
           draft.mode,
-          draft.videyId ??
-            null,
-          draft.sourceUrl ??
-            null,
-          draft.b2FileName ??
-            null,
+          draft.videyId ?? null,
+          draft.sourceUrl ?? null,
+          draft.b2FileName ?? null,
+          draft.contentType ?? null,
+          draft.mediaType ?? null,
           draft.createdAt
         )
         .run();
@@ -4119,7 +4590,7 @@ async function uploadToVidey(
 }
 
 // ============================================================
-// VIDEO SERVING
+// VIDEO / IMAGE SERVING
 // ============================================================
 
 async function serveVideoByRoute(
@@ -4135,7 +4606,7 @@ async function serveVideoByRoute(
 
   if (!record) {
     return textResponse(
-      "Video tidak ditemukan",
+      "File tidak ditemukan",
       404
     );
   }
@@ -4282,6 +4753,23 @@ async function streamFromB2(
     new Headers(
       upstreamResp.headers
     );
+
+  // [NEW] Tentukan Content-Type yang benar (image vs video)
+  const ext = "." + String(record.b2FileName || "")
+    .split(".")
+    .pop()
+    .toLowerCase();
+
+  const isImage = record.mediaType === "image";
+
+  const inferredType = isImage
+    ? (IMAGE_EXT_TO_MIME[ext] || "application/octet-stream")
+    : "video/mp4";
+
+  responseHeaders.set(
+    "Content-Type",
+    record.contentType || inferredType
+  );
 
   responseHeaders.set(
     "Access-Control-Allow-Origin",
@@ -4559,6 +5047,8 @@ async function handleList(
           videy_id AS videyId,
           source_url AS sourceUrl,
           b2_file_name AS b2FileName,
+          content_type AS contentType,
+          media_type AS mediaType,
           created_at AS createdAt
         FROM ${D1_VIDEOS_TABLE}
         ORDER BY order_num ASC
@@ -4804,7 +5294,7 @@ async function handleLegacyList(
 }
 
 // ============================================================
-// FIND RECORD
+// FIND RECORD  [UPDATED: tambah kolom baru]
 // ============================================================
 
 async function findRecordByRoute(
@@ -4834,6 +5324,8 @@ async function findRecordByRoute(
               videy_id AS videyId,
               source_url AS sourceUrl,
               b2_file_name AS b2FileName,
+              content_type AS contentType,
+              media_type AS mediaType,
               created_at AS createdAt
             FROM ${D1_VIDEOS_TABLE}
             WHERE order_num = ?
@@ -4869,6 +5361,8 @@ async function findRecordByRoute(
               videy_id AS videyId,
               source_url AS sourceUrl,
               b2_file_name AS b2FileName,
+              content_type AS contentType,
+              media_type AS mediaType,
               created_at AS createdAt
             FROM ${D1_VIDEOS_TABLE}
             WHERE slug = ?
@@ -5076,39 +5570,37 @@ function makeVideoKey(
   return `${VIDEO_PREFIX}${String(order)}:${String(slug)}`;
 }
 
+// [UPDATED] Support image extensions
 function parsePublicRoute(
   pathname
 ) {
-  const m1 =
-    pathname.match(
-      /^\/(\d+)\/([^/]+)\.mp4$/i
-    );
+  // /<order>/<slug>.<ext>
+  const m1 = pathname.match(
+    /^\/(\d+)\/([^/]+)\.([a-zA-Z0-9]{2,5})$/i
+  );
 
   if (m1) {
+    const ext = "." + m1[3].toLowerCase();
     return {
-      order:
-        m1[1],
-      slug:
-        decodeURIComponentSafe(
-          m1[2]
-        )
+      order: m1[1],
+      slug: decodeURIComponentSafe(m1[2]),
+      ext,
+      isImage: !!IMAGE_EXT_TO_MIME[ext]
     };
   }
 
-  const m2 =
-    pathname.match(
-      /^\/([^/]+)\.mp4$/i
-    );
+  // /<slug>.<ext>
+  const m2 = pathname.match(
+    /^\/([^/]+)\.([a-zA-Z0-9]{2,5})$/i
+  );
 
   if (m2) {
+    const ext = "." + m2[2].toLowerCase();
     return {
-      order:
-        null,
-
-      slug:
-        decodeURIComponentSafe(
-          m2[1]
-        )
+      order: null,
+      slug: decodeURIComponentSafe(m2[1]),
+      ext,
+      isImage: !!IMAGE_EXT_TO_MIME[ext]
     };
   }
 
@@ -5125,7 +5617,7 @@ function parseApiVideoPath(
 
   const m =
     rest.match(
-      /^(\d+)\/([^/]+)(?:\.mp4)?$/i
+      /^(\d+)\/([^/]+)(?:\.(?:mp4|jpg|jpeg|png|gif|webp|avif|bmp|tiff|svg|ico))?$/i
     );
 
   if (m) {
@@ -5147,7 +5639,7 @@ function parseApiVideoPath(
     slug:
       decodeURIComponentSafe(
         rest.replace(
-          /\.mp4$/i,
+          /\.(?:mp4|jpg|jpeg|png|gif|webp|avif|bmp|tiff|svg|ico)$/i,
           ""
         )
       )
@@ -5227,6 +5719,7 @@ function clean(
   ).trim();
 }
 
+// [UPDATED] tambah contentType & mediaType
 function normalizeRecord(
   record
 ) {
@@ -5279,10 +5772,21 @@ function normalizeRecord(
     b2FileName:
       record.b2FileName ??
       record.b2_file_name ??
+      null,
+
+    contentType:
+      record.contentType ??
+      record.content_type ??
+      null,
+
+    mediaType:
+      record.mediaType ??
+      record.media_type ??
       null
   };
 }
 
+// [UPDATED] expose mediaType & contentType ke publik
 function publicRecord(
   record
 ) {
@@ -5323,6 +5827,14 @@ function publicRecord(
   ) {
     out.videyId =
       n.videyId;
+  }
+
+  if (n.mediaType) {
+    out.mediaType = n.mediaType;
+  }
+
+  if (n.contentType) {
+    out.contentType = n.contentType;
   }
 
   return out;
@@ -5736,7 +6248,7 @@ function textResponse(
 }
 
 // ============================================================
-// HTML HOME
+// HTML HOME  [UPDATED]
 // ============================================================
 
 function renderHome(
@@ -5832,15 +6344,25 @@ ul{
       )}/judul-video.mp4
     </code>
   </li>
+
+  <li>
+    <code>
+      ${escapeHtml(
+        url.origin
+      )}/1/foto.jpg
+    </code>
+    &mdash; gambar B2
+  </li>
 </ul>
 
 </div>
 
 <div class="debug">
-<strong>Chunk B2</strong>
+<strong>Chunk B2 &amp; Gambar</strong>
 <p>
-File B2 besar akan memakai Large File API,
-50 MiB per chunk secara default.
+File video B2 besar memakai Large File API, 50 MiB per chunk.
+Gambar B2 (max 25 MiB) diupload via endpoint
+<code>/api/upload/image</code>.
 </p>
 </div>
 
@@ -5849,7 +6371,7 @@ File B2 besar akan memakai Large File API,
 }
 
 // ============================================================
-// HTML UPLOADER
+// HTML UPLOADER  [UPDATED: mode image]
 // ============================================================
 
 function renderUploadPage() {
@@ -6089,6 +6611,15 @@ Upload video (B2)
 <input
 type="radio"
 name="mode"
+value="image"
+>
+Upload gambar (B2 only)
+</label>
+
+<label>
+<input
+type="radio"
+name="mode"
 value="proxy"
 >
 Upload link (Proxy)
@@ -6098,7 +6629,7 @@ Upload link (Proxy)
 
 <div id="videoFields">
 
-<label>File video</label>
+<label>File video / gambar</label>
 
 <input
 type="file"
@@ -6142,6 +6673,7 @@ Upload
 <div class="hint">
 Mode Videy upload ke Videy.
 Mode B2 memakai Chunked Large File otomatis untuk file besar.
+Mode Gambar khusus upload gambar ke B2 (max 25 MiB).
 Mode Proxy hanya menyimpan link sumber.
 </div>
 
@@ -6349,6 +6881,32 @@ function toggleMode(){
 
   chunkInfo.hidden =
     m !== "b2";
+
+  // [NEW] Sesuaikan accept file input
+  const fileInput =
+    form.querySelector(
+      'input[type="file"]'
+    );
+
+  if(fileInput){
+
+    if(m === "image"){
+
+      fileInput.setAttribute(
+        "accept",
+        "image/*"
+      );
+
+    }else{
+
+      fileInput.setAttribute(
+        "accept",
+        "video/*"
+      );
+
+    }
+
+  }
 
 }
 
@@ -6861,16 +7419,6 @@ async function uploadB2Chunked(
     )
   );
 
-  /*
-   * Sequential by default.
-   *
-   * Ini sengaja dibuat sequential supaya:
-   * - urutan mudah didiagnosis
-   * - bandwidth HP tidak langsung habis
-   * - setiap request Worker hanya mengurus 1 chunk
-   * - retry part jadi sederhana
-   */
-
   for(
     let part = 1;
     part <=
@@ -6945,13 +7493,20 @@ function renderResult(
   const ok =
     !!data.ok;
 
+  const isImage =
+    data.mediaType === "image";
+
   const title =
     ok
       ? (
           data.mode ===
           "proxy"
             ? "Successfully saved proxy"
-            : "Successfully uploaded"
+            : (
+                isImage
+                  ? "Gambar berhasil diupload"
+                  : "Successfully uploaded"
+              )
         )
       : "Upload gagal";
 
@@ -6978,6 +7533,10 @@ function renderResult(
 
   const mode =
     data.mode ||
+    "";
+
+  const mediaType =
+    data.mediaType ||
     "";
 
   const message =
@@ -7022,7 +7581,7 @@ function renderResult(
     <div>
       <strong>Mode</strong>
       <br>
-      ${esc(mode)}
+      ${esc(mode)}${mediaType ? " / " + esc(mediaType) : ""}
     </div>
 
   </div>
@@ -7293,12 +7852,114 @@ form.addEventListener(
         true
       );
 
+      // [NEW] Image upload khusus B2
+      if(
+        m === "image"
+      ){
+
+        if(
+          !file
+        ){
+
+          throw new Error(
+            "File gambar wajib dipilih."
+          );
+
+        }
+
+        setStatus(
+          `Mengupload gambar ke B2 (${formatBytes(file.size)})...`
+        );
+
+        progressBar.hidden =
+          false;
+
+        progressBar.value =
+          0;
+
+        const imgFd =
+          new FormData();
+
+        imgFd.append(
+          "title",
+          form
+            .querySelector(
+              'input[name="title"]'
+            )
+            .value
+        );
+
+        imgFd.append(
+          "file",
+          file
+        );
+
+        const imgResp =
+          await fetch(
+            "/api/upload/image",
+            {
+              method:
+                "POST",
+
+              headers:{
+                "Accept":
+                  "application/json",
+
+                "X-Upload-Debug":
+                  "1"
+              },
+
+              body:
+                imgFd
+            }
+          );
+
+        const imgText =
+          await imgResp.text();
+
+        let imgData;
+
+        try{
+
+          imgData =
+            imgText
+              ? JSON.parse(
+                  imgText
+                )
+              : {};
+
+        }catch{
+
+          imgData = {
+            ok:
+              false,
+
+            error:
+              imgText ||
+              `HTTP ${imgResp.status}`
+          };
+
+        }
+
+        progressBar.value =
+          100;
+
+        setStatus(
+          imgData.ok
+            ? "Gambar selesai diupload."
+            : "Upload gambar gagal."
+        );
+
+        renderResult(
+          imgData
+        );
+
+        return;
+
+      }
+
       /*
        * B2 SELALU pakai chunked.
-       *
-       * Ini penting:
-       * request besar TIDAK dikirim ke /api/upload.
-       * Browser memotong file menjadi request kecil.
        */
 
       if(
@@ -7739,7 +8400,7 @@ style="margin-top:10px"
 ${escapeHtml(
   data.mode ??
   ""
-)}
+)}${data.mediaType ? " / " + escapeHtml(data.mediaType) : ""}
 </div>
 
 <div
@@ -7923,7 +8584,7 @@ document
 }
 
 // ============================================================
-// LIST HTML
+// LIST HTML  [UPDATED: Tipe kolom + ext dinamis]
 // ============================================================
 
 function renderListHtml(
@@ -7956,7 +8617,7 @@ function renderListHtml(
 content="width=device-width,initial-scale=1">
 
 <title>
-Daftar Video
+Daftar File
 (${escapeHtml(
   sourceType
 )})
@@ -8020,7 +8681,7 @@ th{
 <body>
 
 <h1>
-Daftar Video
+Daftar File
 (${escapeHtml(
   sourceType
 )})
@@ -8028,7 +8689,7 @@ Daftar Video
 
 <p>
 <a href="/api/upload">
-Upload video baru
+Upload baru
 </a>
 |
 <a href="/">
@@ -8045,7 +8706,8 @@ Beranda
 <th>Slug</th>
 <th>Title</th>
 <th>Mode</th>
-<th>Stream URL</th>
+<th>Tipe</th>
+<th>URL</th>
 </tr>
 
 </thead>
@@ -8055,8 +8717,20 @@ Beranda
   for (
     const item of items
   ) {
+    // [NEW] Hitung ekstensi berdasarkan media type
+    const ext =
+      item.mediaType === "image"
+        ? (item.contentType
+            ? (IMAGE_MIME_TO_EXT[item.contentType] || ".jpg")
+            : ".jpg")
+        : ".mp4";
+
     const pubUrl =
-      `${url.origin}/${item.order}/${item.slug}.mp4`;
+      `${url.origin}/${item.order}/${item.slug}${ext}`;
+
+    const tipeLabel =
+      item.mediaType ||
+      (item.mode === "b2" ? "video" : "-");
 
     html +=
       `<tr>
@@ -8081,6 +8755,12 @@ ${escapeHtml(
 <td>
 ${escapeHtml(
   item.mode
+)}
+</td>
+
+<td>
+${escapeHtml(
+  tipeLabel
 )}
 </td>
 
@@ -8137,7 +8817,7 @@ Halaman Berikutnya →
 }
 
 // ============================================================
-// LEGACY LIST HTML
+// LEGACY LIST HTML  [UPDATED: Tipe kolom]
 // ============================================================
 
 function renderLegacyListHtml(
@@ -8165,7 +8845,7 @@ function renderLegacyListHtml(
 content="width=device-width,initial-scale=1">
 
 <title>
-Daftar Video (KV Legacy)
+Daftar File (KV Legacy)
 </title>
 
 <style>
@@ -8226,12 +8906,12 @@ th{
 <body>
 
 <h1>
-Daftar Video (KV Legacy)
+Daftar File (KV Legacy)
 </h1>
 
 <p>
 <a href="/api/upload">
-Upload video baru
+Upload baru
 </a>
 |
 <a href="/">
@@ -8248,7 +8928,8 @@ Beranda
 <th>Slug</th>
 <th>Title</th>
 <th>Mode</th>
-<th>Stream URL</th>
+<th>Tipe</th>
+<th>URL</th>
 </tr>
 
 </thead>
@@ -8258,8 +8939,19 @@ Beranda
   for (
     const item of items
   ) {
+    const ext =
+      item.mediaType === "image"
+        ? (item.contentType
+            ? (IMAGE_MIME_TO_EXT[item.contentType] || ".jpg")
+            : ".jpg")
+        : ".mp4";
+
     const pubUrl =
-      `${url.origin}/${item.order}/${item.slug}.mp4`;
+      `${url.origin}/${item.order}/${item.slug}${ext}`;
+
+    const tipeLabel =
+      item.mediaType ||
+      (item.mode === "b2" ? "video" : "-");
 
     html +=
       `<tr>
@@ -8285,6 +8977,12 @@ ${escapeHtml(
 <td>
 ${escapeHtml(
   item.mode
+)}
+</td>
+
+<td>
+${escapeHtml(
+  tipeLabel
 )}
 </td>
 
@@ -8364,11 +9062,6 @@ function escapeHtml(
 
 // ============================================================
 // OPTIONAL CORS PREFLIGHT
-// ============================================================
-//
-// Kalau upload dari domain berbeda, fetch browser dapat memakai
-// OPTIONS. Router utama di atas belum membutuhkan endpoint khusus,
-// jadi helper ini disediakan untuk dipakai bila ingin ditambahkan.
 // ============================================================
 
 function corsOptionsResponse(
