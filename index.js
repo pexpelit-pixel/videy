@@ -8,7 +8,7 @@
 //   PUT  /api/upload/chunk/part?uploadId=...&partNumber=...
 //   POST /api/upload/chunk/complete
 //   GET  /api/upload/chunk/status?uploadId=...
-//   POST /api/upload/image            <- [NEW] Gambar B2 only
+//   POST /api/upload/image            <- Gambar B2 only
 //
 // - Chunk dikirim langsung sebagai request body, bukan multipart FormData.
 // - Worker tidak memuat file 2.26 GB ke memory.
@@ -19,7 +19,7 @@
 // - Ada token session agar upload tidak bisa dipalsukan hanya dengan uploadId.
 // - Debug diperketat melalui X-Upload-Debug dan /status.
 // - API /api/upload lama tetap dipertahankan untuk kompatibilitas.
-// - [NEW] Dukungan gambar B2 (single-shot, max 25 MiB).
+// - Dukungan gambar B2 (single-shot, max 25 MiB).
 //
 // Cloudflare membatasi request body Free/Pro 100 MB dan Business 200 MB,
 // sehingga 50 MiB/chunk menjadi pilihan aman.
@@ -69,7 +69,7 @@ const UPLOAD_TOKEN_BYTES = 24;
 const DEBUG_HEADER = "X-Upload-Debug";
 
 // ============================================================
-// IMAGE CONFIG (B2 ONLY)  [NEW]
+// IMAGE CONFIG (B2 ONLY)
 // ============================================================
 
 const MAX_IMAGE_SIZE = 25 * 1024 * 1024; // 25 MiB
@@ -236,7 +236,7 @@ export default {
       }
 
       // --------------------------------------------------------
-      // B2 IMAGE UPLOAD (SINGLE-SHOT)  [NEW]
+      // B2 IMAGE UPLOAD (SINGLE-SHOT)
       // --------------------------------------------------------
 
       if (pathname === "/api/upload/image") {
@@ -365,7 +365,7 @@ async function ensureD1Schema(env) {
           .run();
 
         // ------------------------------------------------------
-        // AUTO MIGRATE VIDEO TABLE  [NEW COLUMNS]
+        // AUTO MIGRATE VIDEO TABLE
         // ------------------------------------------------------
 
         try {
@@ -384,7 +384,6 @@ async function ensureD1Schema(env) {
               .run();
           }
 
-          // [NEW] content_type
           if (!columns.includes("content_type")) {
             await db
               .prepare(`
@@ -394,7 +393,6 @@ async function ensureD1Schema(env) {
               .run();
           }
 
-          // [NEW] media_type
           if (!columns.includes("media_type")) {
             await db
               .prepare(`
@@ -1125,7 +1123,7 @@ async function b2FinishLargeFile(
 }
 
 // ============================================================
-// B2 IMAGE UPLOAD (SINGLE SHOT)  [NEW]
+// B2 IMAGE UPLOAD (SINGLE SHOT)
 // ============================================================
 
 async function b2UploadImage(
@@ -3115,6 +3113,9 @@ async function handleChunkComplete(
       mode:
         "b2",
 
+      mediaType:
+        "video",
+
       publicUrl,
 
       apiUrl,
@@ -3214,7 +3215,7 @@ async function handleChunkComplete(
 }
 
 // ============================================================
-// HANDLE IMAGE UPLOAD  [NEW]
+// HANDLE IMAGE UPLOAD
 // ============================================================
 
 async function handleImageUpload(
@@ -3538,7 +3539,6 @@ function getSafeExtension(
     "video/x-matroska": ".mkv",
     "video/quicktime": ".mov",
     "video/x-msvideo": ".avi",
-    // [NEW] Image fallbacks
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
     "image/png": ".png",
@@ -3869,7 +3869,7 @@ async function handleUpload(
   }
 
   // ----------------------------------------------------------
-  // B2 LEGACY (+ IMAGE SUPPORT)  [UPDATED]
+  // B2 LEGACY (+ IMAGE SUPPORT)
   // ----------------------------------------------------------
 
   if (
@@ -3896,7 +3896,7 @@ async function handleUpload(
       );
 
     // --------------------------------------------------------
-    // IMAGE HANDLING (B2 only)  [NEW]
+    // IMAGE HANDLING (B2 only)
     // --------------------------------------------------------
 
     const isImageFile =
@@ -4297,7 +4297,7 @@ async function handleUpload(
 }
 
 // ============================================================
-// SAVE RECORD  [UPDATED]
+// SAVE RECORD
 // ============================================================
 
 async function saveRecord(
@@ -4754,7 +4754,7 @@ async function streamFromB2(
       upstreamResp.headers
     );
 
-  // [NEW] Tentukan Content-Type yang benar (image vs video)
+  // Tentukan Content-Type yang benar (image vs video)
   const ext = "." + String(record.b2FileName || "")
     .split(".")
     .pop()
@@ -5294,7 +5294,7 @@ async function handleLegacyList(
 }
 
 // ============================================================
-// FIND RECORD  [UPDATED: tambah kolom baru]
+// FIND RECORD
 // ============================================================
 
 async function findRecordByRoute(
@@ -5570,7 +5570,6 @@ function makeVideoKey(
   return `${VIDEO_PREFIX}${String(order)}:${String(slug)}`;
 }
 
-// [UPDATED] Support image extensions
 function parsePublicRoute(
   pathname
 ) {
@@ -5719,7 +5718,6 @@ function clean(
   ).trim();
 }
 
-// [UPDATED] tambah contentType & mediaType
 function normalizeRecord(
   record
 ) {
@@ -5786,7 +5784,6 @@ function normalizeRecord(
   };
 }
 
-// [UPDATED] expose mediaType & contentType ke publik
 function publicRecord(
   record
 ) {
@@ -6248,7 +6245,7 @@ function textResponse(
 }
 
 // ============================================================
-// HTML HOME  [UPDATED]
+// HTML HOME
 // ============================================================
 
 function renderHome(
@@ -6371,7 +6368,7 @@ Gambar B2 (max 25 MiB) diupload via endpoint
 }
 
 // ============================================================
-// HTML UPLOADER  [UPDATED: mode image]
+// HTML UPLOADER
 // ============================================================
 
 function renderUploadPage() {
@@ -6882,7 +6879,6 @@ function toggleMode(){
   chunkInfo.hidden =
     m !== "b2";
 
-  // [NEW] Sesuaikan accept file input
   const fileInput =
     form.querySelector(
       'input[type="file"]'
@@ -7852,7 +7848,6 @@ form.addEventListener(
         true
       );
 
-      // [NEW] Image upload khusus B2
       if(
         m === "image"
       ){
@@ -7958,10 +7953,6 @@ form.addEventListener(
 
       }
 
-      /*
-       * B2 SELALU pakai chunked.
-       */
-
       if(
         m === "b2"
       ){
@@ -7997,10 +7988,6 @@ form.addEventListener(
         return;
 
       }
-
-      /*
-       * PROXY / VIDEY LAMA
-       */
 
       if(
         m === "proxy"
@@ -8584,7 +8571,7 @@ document
 }
 
 // ============================================================
-// LIST HTML  [UPDATED: Tipe kolom + ext dinamis]
+// LIST HTML
 // ============================================================
 
 function renderListHtml(
@@ -8717,7 +8704,6 @@ Beranda
   for (
     const item of items
   ) {
-    // [NEW] Hitung ekstensi berdasarkan media type
     const ext =
       item.mediaType === "image"
         ? (item.contentType
@@ -8817,7 +8803,7 @@ Halaman Berikutnya →
 }
 
 // ============================================================
-// LEGACY LIST HTML  [UPDATED: Tipe kolom]
+// LEGACY LIST HTML
 // ============================================================
 
 function renderLegacyListHtml(
